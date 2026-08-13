@@ -1,0 +1,229 @@
+:root {
+  color: #17202a;
+  background: #eaf0f3;
+  font-family: "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px 20px;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.62), rgba(218, 232, 231, 0.3)),
+    #eaf0f3;
+}
+
+.chat-panel {
+  width: min(860px, 100%);
+  height: min(780px, calc(100vh - 64px));
+  min-height: 560px;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  overflow: hidden;
+  background: #fbfcfc;
+  border: 1px solid #cfdade;
+  border-radius: 8px;
+  box-shadow: 0 18px 45px rgba(43, 66, 73, 0.14);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 22px 26px 18px;
+  border-bottom: 1px solid #dce5e7;
+}
+
+.eyebrow {
+  margin: 0 0 5px;
+  color: #56706f;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #355f50;
+  font-size: 13px;
+}
+
+.status i {
+  width: 8px;
+  height: 8px;
+  display: inline-block;
+  background: #3d9a70;
+  border-radius: 50%;
+}
+
+.conversation {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 28px 26px;
+}
+
+.message {
+  max-width: min(76%, 600px);
+}
+
+.message.user {
+  align-self: flex-end;
+}
+
+.message-label {
+  display: block;
+  margin-bottom: 7px;
+  color: #6c7b80;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.message.user .message-label {
+  text-align: right;
+}
+
+.message p {
+  margin: 0;
+  padding: 13px 15px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.65;
+  background: #edf2f3;
+  border: 1px solid #dce5e7;
+  border-radius: 7px;
+}
+
+.message.user p {
+  color: #fff;
+  background: #286c66;
+  border-color: #286c66;
+}
+
+.pending p {
+  color: #577073;
+}
+
+.composer {
+  padding: 16px 20px 18px;
+  border-top: 1px solid #dce5e7;
+  background: #f8faf9;
+}
+
+.composer textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 78px;
+  max-height: 220px;
+  padding: 13px;
+  color: #17202a;
+  line-height: 1.55;
+  background: #fff;
+  border: 1px solid #b9c9cd;
+  border-radius: 6px;
+  outline: none;
+}
+
+.composer textarea:focus {
+  border-color: #286c66;
+  box-shadow: 0 0 0 3px rgba(40, 108, 102, 0.12);
+}
+
+.composer-footer {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.composer-footer span {
+  color: #718084;
+  font-size: 12px;
+}
+
+.composer button {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: #fff;
+  background: #286c66;
+  border: 0;
+  border-radius: 6px;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.composer button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.error {
+  margin: 0 0 10px;
+  color: #ad302c;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+@media (max-width: 640px) {
+  .app-shell {
+    padding: 0;
+  }
+
+  .chat-panel {
+    width: 100%;
+    height: 100vh;
+    min-height: 0;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .topbar,
+  .conversation {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+
+  .message {
+    max-width: 88%;
+  }
+
+  .composer {
+    padding: 14px 18px 16px;
+  }
+}

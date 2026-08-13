@@ -1,5 +1,62 @@
 # TripWeave - 旅差智能助手
 
+## 当前 Demo
+
+第一版已提供一个最小可用的 Agent 对话 Demo：
+
+- 前端：React + Vite 中文聊天界面
+- 后端：FastAPI 的 `POST /api/v1/chat/messages`
+- 模型：DeepSeek `deepseek-v4-flash`
+- 会话：仅保存在浏览器当前页面，不写入数据库
+
+### 启动
+
+1. 在 `backend` 目录创建 `.env`，填写 DeepSeek API 密钥：
+
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+
+   编辑 `backend/.env`，设置：
+
+   ```dotenv
+   DEEPSEEK_API_KEY=你的密钥
+   ```
+
+2. 启动后端：
+
+   ```powershell
+   cd backend
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   uvicorn app.main:app --reload --port 8000
+   ```
+
+3. 新开一个终端，启动前端：
+
+   ```powershell
+   cd frontend
+   npm install
+   npm run dev
+   ```
+
+浏览器打开 Vite 显示的地址，默认通常为 `http://localhost:5173`。后端健康检查为 `http://127.0.0.1:8000/api/v1/health`，也可访问 `http://127.0.0.1:8000/health`。
+
+### 配置
+
+后端从 `backend/.env` 读取以下变量：
+
+| 变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `DEEPSEEK_API_KEY` | 空 | DeepSeek API 密钥，必填 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容 API 地址 |
+| `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 对话模型 |
+
+前端可选通过 `VITE_API_BASE_URL` 指向不同的后端地址；默认使用 `http://127.0.0.1:8000`。
+
+---
+
 ## 1. 项目概述
 
 TripWeave 是一个基于 LangGraph 的多智能体协作旅差智能助手。用户以自然语言描述出行计划，系统将提取关键出行信息，主动补齐缺失条件，并由多个专业智能体协作完成目的地、交通、行程与酒店方案规划。
@@ -163,11 +220,13 @@ TripWeave/
 │   │   ├── main.py                     # FastAPI 应用入口
 │   │   ├── config.py                   # 环境变量与应用配置
 │   │   ├── api/
-│   │   │   ├── deps.py
-│   │   │   └── v1/
-│   │   │       ├── chat.py             # 对话与流式规划接口
+│   │   │   ├── exception/
+│   │   │   │   ├── exceptions.py       # 自定义异常类与错误响应结构
+│   │   │   │   └── exception_handlers.py # 统一异常处理函数
+│   │   │   └── router/
+│   │   │       ├── chat.py             # 对话接口与模型调用
 │   │   │       ├── trips.py            # 行程 CRUD、确认、重规划
-│   │   │       └── health.py
+│   │   │       └── health.py            # 健康检查接口
 │   │   ├── agents/
 │   │   │   ├── graph.py                # LangGraph 图构建与路由
 │   │   │   ├── state.py                # 共享状态和 reducer
