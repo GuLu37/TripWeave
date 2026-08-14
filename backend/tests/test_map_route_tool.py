@@ -83,6 +83,47 @@ class AmapMapRouteToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["errcode"], 0)
 
+    async def test_nearby_search_uses_official_v3_around_parameters(self) -> None:
+        """周边搜索应使用中心点、半径、分类和排序规则构造官方请求。"""
+
+        captured_request: httpx.Request | None = None
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            """模拟高德 v3 周边搜索成功响应并保存请求。"""
+
+            nonlocal captured_request
+            # 第一步：记录出站请求，供断言检查官方周边搜索参数。
+            captured_request = request
+            return httpx.Response(
+                200,
+                json={"status": "1", "info": "OK", "pois": []},
+            )
+
+        tool = AmapMapRouteTool(
+            api_key="test-key",
+            base_url="https://restapi.amap.com",
+            transport=httpx.MockTransport(handler),
+        )
+
+        # 第二步：按距离检索指定坐标附近的餐饮服务。
+        result = await tool.search_nearby(
+            "116.397,39.908",
+            types="050000",
+            radius_meters=1500,
+            sort_rule="distance",
+            page_size=10,
+        )
+
+        self.assertEqual(result["status"], "1")
+        self.assertIsNotNone(captured_request)
+        assert captured_request is not None
+        self.assertEqual(captured_request.url.path, "/v3/place/around")
+        self.assertEqual(captured_request.url.params["location"], "116.397,39.908")
+        self.assertEqual(captured_request.url.params["types"], "050000")
+        self.assertEqual(captured_request.url.params["radius"], "1500")
+        self.assertEqual(captured_request.url.params["sortrule"], "distance")
+        self.assertEqual(captured_request.url.params["offset"], "10")
+
     async def test_transit_route_requires_departure_city(self) -> None:
         """公交规划缺少官方必填城市参数时不得发送网络请求。"""
 

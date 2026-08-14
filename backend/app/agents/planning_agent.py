@@ -2,16 +2,20 @@
 
 import json
 import logging
+from typing import cast
 
-from app.agents.prompts import load_prompt
+from app.agents.planning_evidence import collect_trip_evidence
+from app.agents.prompts import load_planning_skill_sections, load_prompt
 from app.api.exception.exceptions import AppException
 from app.integrations.llm.client import chat_with_llm
 from app.schemas import ClientChatMessage, TripRequirements
+from app.tools.map_route_tool import AmapMapRouteTool
+from app.tools.weather_tool import QWeatherTool
 
 logger = logging.getLogger(__name__)
 
 PLANNING_TEMPERATURE = 0.4
-PLANNING_MAX_TOKENS = 1_600
+PLANNING_MAX_TOKENS = 2_400
 PLANNING_MAX_ATTEMPTS = 2
 REQUIRED_FIELDS = (
     "destination",
@@ -57,49 +61,113 @@ class TripPlanningException(AppException):
         )
 
 
-async def plan_trip(requirements: TripRequirements) -> str:
-    """根据已确认的旅行需求生成待外部数据核验的行程草案。"""
+async def plan_trip(
+    requirements: TripRequirements,
+    *,
+    map_route_tool: AmapMapRouteTool | None = None,
+    weather_tool: QWeatherTool | None = None,
+    replan_context: dict[str, object] | None = None,
+) -> str:
+    """根据完整需求和可信证据生成中文旅差方案。"""
 
     # 第一步：规划只接收完整需求，信息不足时由统一入口继续追问。
     missing_fields = _get_missing_fields(requirements)
     if missing_fields:
         raise TripPlanningException.requirements_incomplete(missing_fields)
 
-    # 第二步：将领域模型压缩为 JSON 用户上下文，避免在提示词内重复拼装字段。
-    requirements_text = json.dumps(
-        requirements.model_dump(exclude_none=True, exclude_defaults=True),
-        ensure_ascii=False,
-        separators=(",", ":"),
+    # 第二步：取证函数独立完成第三方调用和结果收敛，Agent 只负责生成阶段。
+    tool_evidence = await collect_trip_evidence(
+        requirements,
+        map_route_tool=map_route_tool or AmapMapRouteTool(),
+        weather_tool=weather_tool or QWeatherTool(),
     )
+    system_prompt = _build_planning_system_prompt(tool_evidence)
     logger.info(
-        "规划 Agent 开始生成草案：destination_present=%s departure_present=%s "
-        "traveler_count=%s has_budget=%s fixed_schedule_count=%s",
+        "规划 Agent 开始生成方案：destination_present=%s departure_present=%s "
+        "traveler_count=%s has_budget=%s fixed_schedule_count=%s unavailable_tool_count=%s",
         bool(requirements.destination),
         bool(requirements.departure_date),
         requirements.traveler_count,
         bool(requirements.budget),
         len(requirements.fixed_schedule),
+        len(cast(list[object], tool_evidence["unavailable_tools"])),
     )
-    # 第三步：当前 Tools 仍未接入，Agent 仅生成待核验草案，不调用外部能力或编造时效数据。
+
+    # 第三步：模型只接收已验证、可追溯的需求、工具证据和有限重规划反馈，不自行调用外部能力。
+    replan_text = ""
+    if replan_context:
+        replan_text = (
+            "\n\n本轮重规划反馈如下：\n"
+            f"{json.dumps(replan_context, ensure_ascii=False, separators=(',', ':'))}"
+        )
     proposal = await chat_with_llm(
         [
             ClientChatMessage(
                 role="user",
-                content=f"已确认旅行需求如下：\n{requirements_text}",
+                content=(
+                    "已确认旅行需求如下：\n"
+                    f"{json.dumps(requirements.model_dump(exclude_none=True, exclude_defaults=True), ensure_ascii=False, separators=(',', ':'))}\n\n"
+                    "可信 Tool 证据如下：\n"
+                    f"{json.dumps(tool_evidence, ensure_ascii=False, separators=(',', ':'))}"
+                    f"{replan_text}"
+                ),
             )
         ],
-        system_prompt=load_prompt("planning_agent_prompt.md"),
+        system_prompt=system_prompt,
         temperature=PLANNING_TEMPERATURE,
         max_tokens=PLANNING_MAX_TOKENS,
         max_attempts=PLANNING_MAX_ATTEMPTS,
+        # 第四步：DeepSeek 的长推理会占用正文额度，规划场景明确优先输出可展示方案。
+        disable_thinking=True,
         caller_name="planning_agent",
     )
 
-    # 第四步：空白文本不能作为可展示草案，统一转换为可识别业务异常。
+    # 第五步：空白文本不能作为可展示方案，统一转换为可识别业务异常。
     normalized_proposal = proposal.strip()
     if not normalized_proposal:
         raise TripPlanningException.empty_proposal()
     return normalized_proposal
+
+
+def _build_planning_system_prompt(tool_evidence: dict[str, object]) -> str:
+    """组合规划 Agent 固定提示词与当前证据对应的 Skill 小节。"""
+
+    # 第一步：固定提示词约束事实边界和 Markdown 输出结构。
+    planning_prompt = load_prompt("planning_agent_prompt.md")
+    # 第二步：只有实际可用的工具说明进入上下文，避免无关 Skill 长期占用 Token。
+    skill_sections = load_planning_skill_sections(
+        _get_relevant_skill_sections(tool_evidence)
+    )
+    return f"{planning_prompt}\n\n{skill_sections}"
+
+
+def _get_relevant_skill_sections(
+    tool_evidence: dict[str, object],
+) -> tuple[str, ...]:
+    """根据当前工具证据选择需要注入规划上下文的 Skill 小节。"""
+
+    # 第一步：地图定位能力始终适用，其他工具说明仅在对应证据实际可用时加入。
+    sections = ["map_route_tool"]
+    if _has_non_empty_list(tool_evidence.get("accommodation_candidates")):
+        sections.append("accommodation_tool")
+    if _has_non_empty_list(tool_evidence.get("attraction_candidates")):
+        sections.append("attraction_tool")
+    if _has_non_empty_list(tool_evidence.get("food_candidates")):
+        sections.append("food_tool")
+    weather = tool_evidence.get("weather")
+    if isinstance(weather, dict) and weather.get("status") == "available":
+        sections.append("weather_tool")
+    local_transport = tool_evidence.get("local_transport")
+    if isinstance(local_transport, dict) and local_transport.get("status") == "available":
+        sections.append("transport_tool")
+    return tuple(sections)
+
+
+def _has_non_empty_list(value: object) -> bool:
+    """判断工具证据是否包含至少一个可用候选项。"""
+
+    # 第一步：只接受非空列表，防止错误对象或空数组触发无关 Skill 小节加载。
+    return isinstance(value, list) and bool(value)
 
 
 def _get_missing_fields(requirements: TripRequirements) -> list[str]:

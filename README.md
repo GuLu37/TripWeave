@@ -13,7 +13,7 @@
 
 ### 当前子智能体逻辑（截至 2026-08-14）
 
-当前仅实现一个统一入口 Agent：`backend/app/agents/conversation_entry_agent.py`。它替代独立闲聊 Agent 与纯需求分析 Agent，避免为一次用户消息重复调用模型。
+当前运行时已接通两个 Agent：统一入口 Agent 负责意图判断、需求提取与关键追问；完整旅差需求会经 LangGraph 进入规划 Agent。规划 Agent 调用高德地点/路线、住宿/景点/餐饮 POI 与和风天气工具，收敛可信证据后生成方案。
 
 ```mermaid
 flowchart TD
@@ -27,8 +27,13 @@ flowchart TD
     H -- "chat" --> I["返回普通聊天回复"]
     H -- "trip_planning" --> J["提取 TripRequirements"]
     J --> K["本地计算缺失字段与完整性"]
-    I --> L["返回 analysis"]
-    K --> L
+    K --> M{"需求完整？"}
+    M -- "否" --> L["返回关键追问"]
+    M -- "是" --> N["规划 Agent 与可信 Tools"]
+    N --> O["返回旅差方案"]
+    I --> P["返回 analysis"]
+    L --> P
+    O --> P
 ```
 
 入口 Agent 的输出为 `ConversationAnalysis`：
@@ -60,8 +65,8 @@ flowchart TD
 
 | 状态 | 内容 |
 | --- | --- |
-| 已实现 | 统一入口 Agent、结构化需求提取、普通聊天分流、全局/Agent 系统提示词、文本清洗、Pydantic 校验、LLM 重试与供应商切换、前端失败回合重试、行程快速补充面板、核心结构化响应单元测试 |
-| 未实现 | LangGraph 图、共享状态持久化、交通/酒店/行程/预算/审核 Agent、地图/天气/酒店实时工具、数据库、Redis、`/api/v1/trips` 接口、端到端测试与 Docker 部署 |
+| 已实现 | 统一入口 Agent、LangGraph 两节点路由、规划 Agent、结构化需求提取、全局/Agent 系统提示词、LLM 重试与供应商切换、高德地点/路线与 POI 工具、和风天气工具、前端失败回合重试、行程快速补充面板、工具和 Agent 单元测试 |
+| 未实现 | 共享状态持久化、城市间实时票价与库存、规则校验/审核 Agent、数据库、Redis、`/api/v1/trips` 接口、端到端测试与 Docker 部署 |
 
 ### 启动
 
@@ -188,7 +193,7 @@ flowchart LR
 
 ## 3. 技术栈
 
-当前 Demo 已实际使用 Python、FastAPI、Pydantic、httpx、React、TypeScript 和 Vite。下表中的 LangGraph、LangChain、数据库、缓存、外部工具、测试和 Docker 为后续目标，尚未接入当前运行时。
+当前 Demo 已实际使用 Python、FastAPI、Pydantic、httpx、LangGraph、高德地图、和风天气、React、TypeScript 和 Vite。LangChain、数据库、缓存、Docker 与端到端测试仍属于后续目标。
 
 | 分层 | 技术选择 | 用途 |
 | --- | --- | --- |
@@ -259,7 +264,7 @@ flowchart TD
 
 ### 4.3 当前入口与后续子 Agent 协作
 
-当前 Demo 已实现统一入口 Agent。它负责普通聊天与旅差规划意图分流、用户回复生成和 `TripRequirements` 提取；它不调用地图、交通、酒店或预订工具，也不生成旅行方案。
+当前 Demo 已实现统一入口 Agent 与规划 Agent。统一入口负责普通聊天与旅差规划意图分流、用户回复生成和 `TripRequirements` 提取；规划 Agent 只在需求完整时调用可信 Tools 并生成方案，不处理真实预订。
 
 ```mermaid
 flowchart TD
@@ -269,7 +274,9 @@ flowchart TD
     C -- "trip_planning" --> E["提取结构化需求"]
     E --> F{"核心条件完整？"}
     F -- "否" --> G["返回单个澄清问题"]
-    F -- "是" --> H["输出需求，等待后续规划工作流"]
+    F -- "是" --> H["LangGraph 进入规划 Agent"]
+    H --> I["地点、路线、POI 与天气 Tools"]
+    I --> J["返回旅差方案"]
 ```
 
 目标工作流中，普通聊天在统一入口直接结束；只有完整的旅差需求会进入任务拆分规划 Agent。规划 Agent 仅通过白名单 Tools 查询吃住行信息，ToolExecutor 负责参数校验、缓存、并行、超时和失败降级。规则校验失败时，系统只把受影响的任务退回规划 Agent，且必须设置最大重规划次数；超过上限时返回风险与待用户决策项。

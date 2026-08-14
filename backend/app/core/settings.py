@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     deepseek_base_url: str | None = None
     deepseek_model: str | None = None
+    # 审核总结使用独立 Pro 模型，避免入口与规划模型配置变化影响审批质量。
+    deepseek_review_model: str = Field(default="deepseek-v4-pro", min_length=1)
     openai_api_key: str | None = None
     openai_base_url: str | None = None
     openai_model: str | None = None

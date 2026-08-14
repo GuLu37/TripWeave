@@ -134,7 +134,7 @@ class ModelException(AppException):
         return cls(
             status_code=502,
             code="LLM_FALLBACK_EXHAUSTED",
-            message="所有已配置的大模型供应商均暂时不可用。",
+            message="当前没有候选大模型完成本次调用，请检查主模型响应与备用模型配置。",
             details=failures,
         )
 

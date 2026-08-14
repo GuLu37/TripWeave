@@ -184,6 +184,82 @@ class AmapMapRouteTool:
         # 第二步：调用官方 v3 POI 关键字搜索端点，供餐饮、住宿和景点工具复用。
         return await self._request("/v3/place/text", params, response_version="v3")
 
+    async def search_nearby(
+        self,
+        location: str,
+        *,
+        keywords: str | None = None,
+        types: str | None = None,
+        radius_meters: int = 5_000,
+        sort_rule: Literal["distance", "weight"] = "distance",
+        page_size: int = 20,
+        page: int = 1,
+        extensions: Literal["base", "all"] = "base",
+    ) -> dict[str, object]:
+        """按坐标检索附近 POI，并支持关键词、类型和距离范围过滤。
+
+        Args:
+            location: 必填中心点坐标，格式为 ``"经度,纬度"``，小数点后最多六位。
+            keywords: 可选地点关键词，例如 ``"川菜"``、``"咖啡馆"``。
+            types: 可选高德 POI 分类编码，例如餐饮服务 ``"050000"``。
+            radius_meters: 搜索半径，范围 0 到 50000，单位为米，默认 5000。
+            sort_rule: ``"distance"`` 按距离排序，``"weight"`` 按高德综合权重排序。
+            page_size: 单页数量，范围 1 到 25，默认 20。
+            page: 页码，从 1 开始，默认 1。
+            extensions: ``"base"`` 返回基础地址信息；``"all"`` 增加附近 POI、道路等信息。
+
+        Returns:
+            高德 v3 周边搜索响应。Agent 应从 ``pois`` 读取候选 POI，并使用每项的
+            ``distance``、``location``、``name``、``type`` 与 ``address`` 进行比较。
+
+        Raises:
+            AmapException: 坐标、搜索范围、分页、排序规则非法，或 ``keywords`` 与
+                ``types`` 同时缺失时抛出 ``AMAP_PARAMETER_INVALID``。
+
+        Example:
+            ```python
+            result = await amap_tool.search_nearby(
+                "120.15507,30.274085",
+                keywords="杭帮菜",
+                types="050000",
+                radius_meters=1500,
+            )
+            restaurants = result["pois"]
+            ```
+        """
+
+        # 第一步：高德周边搜索要求 keywords 与 types 至少存在一个，并限制半径和分页范围。
+        if keywords is None and types is None:
+            raise AmapException.invalid_parameter("keywords_or_types")
+        if not isinstance(radius_meters, int) or isinstance(radius_meters, bool):
+            raise AmapException.invalid_parameter("radius_meters")
+        if not 0 <= radius_meters <= 50_000:
+            raise AmapException.invalid_parameter("radius_meters")
+        if not 1 <= page_size <= 25:
+            raise AmapException.invalid_parameter("page_size")
+        if page < 1:
+            raise AmapException.invalid_parameter("page")
+        if sort_rule not in {"distance", "weight"}:
+            raise AmapException.invalid_parameter("sort_rule")
+        if extensions not in {"base", "all"}:
+            raise AmapException.invalid_parameter("extensions")
+
+        # 第二步：复用统一坐标校验，并按官方字段组装周边搜索请求参数。
+        params = {
+            "location": _require_coordinate(location, "location"),
+            "radius": str(radius_meters),
+            "sortrule": sort_rule,
+            "offset": str(page_size),
+            "page": str(page),
+            "extensions": extensions,
+        }
+        if keywords is not None:
+            params["keywords"] = _require_text(keywords, "keywords")
+        if types is not None:
+            params["types"] = _require_text(types, "types")
+        # 第三步：调用高德 v3 周边搜索端点，供餐饮、住宿和景点工具按地点复用。
+        return await self._request("/v3/place/around", params, response_version="v3")
+
     async def plan_route(
         self,
         mode: RouteMode,

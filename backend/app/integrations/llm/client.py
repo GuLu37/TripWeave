@@ -4,14 +4,12 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 
 from app.api.exception.exceptions import ModelException
 from app.core.settings import Settings, get_settings
-from app.integrations.llm.deepseek_client import chat_with_deepseek
 from app.integrations.llm.log_safety import redact_debug_text
-from app.integrations.llm.openai_client import chat_with_openai
-from app.integrations.llm.proxy_client import chat_with_proxy
+from app.integrations.llm.openai_compatible import request_openai_compatible_chat
 from app.schemas import ClientChatMessage
 
 logger = logging.getLogger(__name__)
@@ -21,18 +19,28 @@ STRUCTURED_OUTPUT_RETRY_INSTRUCTION = (
     "请严格遵守本次任务的 JSON 契约：只返回单个合法 JSON 对象，"
     "字段名和字段类型必须完全匹配，不要输出 Markdown、解释或额外文本。"
 )
-# 所有供应商客户端遵守同一个输入输出契约，便于后续新增模型而不改路由层。
-ChatClient = Callable[
-    [Settings, list[ClientChatMessage], str | None, float, int | None, bool],
-    Awaitable[str],
-]
 # Agent 可传入响应校验器，将结构化输出错误纳入供应商兜底策略。
 ResponseValidator = Callable[[str], object]
-# 注册表是供应商名称到实际客户端的唯一映射来源。
-CLIENTS: dict[str, ChatClient] = {
-    "deepseek": chat_with_deepseek,
-    "openai": chat_with_openai,
-    "proxy": chat_with_proxy,
+# 三家供应商都使用同一兼容协议，差异仅保留展示名称和对应配置字段。
+_PROVIDER_SETTINGS: dict[str, tuple[str, str, str, str]] = {
+    "deepseek": (
+        "DeepSeek",
+        "deepseek_api_key",
+        "deepseek_base_url",
+        "deepseek_model",
+    ),
+    "openai": (
+        "OpenAI",
+        "openai_api_key",
+        "openai_base_url",
+        "openai_model",
+    ),
+    "proxy": (
+        "第三方中转站",
+        "proxy_api_key",
+        "proxy_base_url",
+        "proxy_model",
+    ),
 }
 
 
@@ -45,20 +53,27 @@ async def chat_with_llm(
     max_tokens: int | None = None,
     max_attempts: int | None = None,
     json_mode: bool = False,
+    disable_thinking: bool = False,
+    provider_override: str | None = None,
+    model_override: str | None = None,
+    enable_thinking: bool = False,
     caller_name: str = "unspecified",
 ) -> str:
     """按优先级调用大模型，并在可恢复失败时进行重试与兜底。"""
 
     settings = get_settings()
     attempt_limit = max_attempts or settings.llm_max_retries
-    # 主供应商排在第一位，随后按 .env 声明的备用顺序依次尝试。
-    providers = _get_provider_sequence(settings)
+    # 主供应商排在第一位；特定 Agent 可固定供应商，避免模型覆盖错误发往其他兼容接口。
+    providers = (
+        [provider_override.strip().lower()]
+        if provider_override and provider_override.strip()
+        else _get_provider_sequence(settings)
+    )
     # 汇总无敏感信息的失败记录，所有备用项耗尽后返回给统一异常处理器。
     failures: list[dict[str, object]] = []
 
     for provider in providers:
-        client = CLIENTS.get(provider)
-        if client is None:
+        if provider not in _PROVIDER_SETTINGS:
             # 未支持的名称不发起请求，记录后继续尝试后续备用项。
             error = ModelException.provider_unsupported(provider)
             failures.append(_failure_record(provider, 0, error))
@@ -72,7 +87,6 @@ async def chat_with_llm(
             # 当前供应商内部先完成有限重试，成功后立即结束整个兜底链路。
             return await _call_with_retries(
                 provider,
-                client,
                 settings,
                 messages,
                 failures,
@@ -83,6 +97,9 @@ async def chat_with_llm(
                 attempt_limit,
                 json_mode,
                 caller_name,
+                disable_thinking,
+                model_override,
+                enable_thinking,
             )
         except ModelException as error:
             if error.fallbackable:
@@ -100,6 +117,44 @@ async def chat_with_llm(
     raise ModelException.fallback_exhausted(failures)
 
 
+async def _request_configured_provider(
+    provider: str,
+    settings: Settings,
+    messages: list[ClientChatMessage],
+    system_prompt: str | None,
+    temperature: float,
+    max_tokens: int | None,
+    json_mode: bool,
+    disable_thinking: bool = False,
+    model_override: str | None = None,
+    enable_thinking: bool = False,
+) -> str:
+    """按供应商配置调用同一 OpenAI 兼容客户端。"""
+
+    # 第一步：供应商名称已由外层注册表校验，读取其唯一对应的连接配置字段。
+    display_name, api_key_field, base_url_field, model_field = _PROVIDER_SETTINGS[
+        provider
+    ]
+    # 第二步：只在此处完成字段映射，重试、提示词与协议校验继续由既有公共模块负责。
+    return await request_openai_compatible_chat(
+        provider=display_name,
+        api_key=getattr(settings, api_key_field),
+        base_url=getattr(settings, base_url_field),
+        model=model_override or getattr(settings, model_field),
+        messages=messages,
+        system_prompt=system_prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        json_mode=json_mode,
+        debug_log_raw_output=settings.llm_debug_log_raw_output,
+        # 第三步：DeepSeek 的结构化调用默认关闭思考，指定 Agent 也可显式关闭以保证正文输出。
+        disable_thinking=provider == "deepseek"
+        and not enable_thinking
+        and (json_mode or disable_thinking),
+        enable_thinking=provider == "deepseek" and enable_thinking,
+    )
+
+
 def _get_provider_sequence(settings: Settings) -> list[str]:
     """按主供应商和备用供应商配置生成去重后的调用顺序。"""
 
@@ -113,7 +168,6 @@ def _get_provider_sequence(settings: Settings) -> list[str]:
 
 async def _call_with_retries(
     provider: str,
-    client: ChatClient,
     settings: Settings,
     messages: list[ClientChatMessage],
     failures: list[dict[str, object]],
@@ -124,6 +178,9 @@ async def _call_with_retries(
     max_attempts: int,
     json_mode: bool,
     caller_name: str,
+    disable_thinking: bool = False,
+    model_override: str | None = None,
+    enable_thinking: bool = False,
 ) -> str:
     """对单个供应商进行最多指定次数的可恢复失败重试。"""
 
@@ -137,12 +194,18 @@ async def _call_with_retries(
                 attempt,
             )
             # 每次尝试都会记录供应商和序号，便于从日志确认实际兜底路径。
+            model_name = model_override or getattr(
+                settings,
+                _PROVIDER_SETTINGS[provider][3],
+                None,
+            )
             logger.info(
-                "调用 LLM：caller=%s provider=%s attempt=%s/%s message_count=%s "
+                "调用 LLM：caller=%s provider=%s model=%s attempt=%s/%s message_count=%s "
                 "system_prompt_chars=%s json_mode=%s temperature=%s max_tokens=%s "
                 "structured_retry=%s",
                 caller_name,
                 provider,
+                model_name,
                 attempt,
                 max_attempts,
                 len(messages),
@@ -153,13 +216,17 @@ async def _call_with_retries(
                 response_validator is not None and attempt > 1,
             )
             # 将 Agent 专用指令作为后端 system prompt 传递，避免被误当作用户历史消息。
-            response = await client(
+            response = await _request_configured_provider(
+                provider,
                 settings,
                 messages,
                 effective_system_prompt,
                 temperature,
                 max_tokens,
                 json_mode,
+                disable_thinking,
+                model_override,
+                enable_thinking,
             )
             # 记录响应指纹和形态，不记录原文，便于关联格式失败而不泄露对话内容。
             response_metadata = _response_metadata(response)
@@ -189,9 +256,10 @@ async def _call_with_retries(
                 )
             # 当前供应商成功返回后记录实际命中的模型与请求次数，便于排查兜底链路。
             logger.info(
-                "大模型调用成功：caller=%s 模型=%s 请求次数=%s/%s",
+                "大模型调用成功：caller=%s provider=%s model=%s 请求次数=%s/%s",
                 caller_name,
                 provider,
+                model_name,
                 attempt,
                 max_attempts,
             )

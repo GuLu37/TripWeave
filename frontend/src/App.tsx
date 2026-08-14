@@ -25,15 +25,34 @@ type TripRequirements = {
   traveler_count: number | null;
   budget: string | null;
   transport_preferences: string[];
+  accommodation_preferences: string[];
+  dining_preferences: string[];
   attraction_preferences: string[];
+  general_preferences: string[];
+  fixed_schedule: string[];
 };
 
 type ConversationAnalysis = {
   intent: "chat" | "trip_planning";
   reply: string;
   requirements: TripRequirements | null;
+  plan_action: "plan" | "modify" | "confirm" | null;
+  pending_plan: TripPlanSnapshot | null;
   missing_fields: string[];
   is_complete: boolean | null;
+};
+
+type ReviewResult = {
+  status: "ready_for_confirmation" | "needs_replanning" | "needs_user_decision";
+  summary: string;
+  risks: string[];
+  pending_items: string[];
+};
+
+type TripPlanSnapshot = {
+  requirements: TripRequirements;
+  proposal: string;
+  review_result: ReviewResult;
 };
 
 type ChatApiResponse = {
@@ -162,6 +181,8 @@ function App() {
           known_requirements: analysis?.intent === "trip_planning"
             ? analysis.requirements
             : undefined,
+          // 第三步：待确认方案随下一轮提交，后端可判断用户是在确认还是修改上一版方案。
+          pending_plan: analysis?.pending_plan ?? undefined,
         }),
       });
       const data = await response.json().catch(() => null) as ChatApiResponse | ChatApiError | null;
@@ -237,6 +258,12 @@ function App() {
     if (!content) return;
     // 第二步：复用聊天发送逻辑，确保失败重试和对话上下文规则完全一致。
     await sendUserMessage(content);
+  }
+
+  /** 确认当前待确认方案。 */
+  async function handleConfirmPlan() {
+    // 第一步：确认消息仍走统一入口，后端根据 pending_plan 决定结束确认分支。
+    await sendUserMessage("确认当前方案");
   }
 
   /** 切换一个行程偏好选项。 */
@@ -320,7 +347,18 @@ function App() {
                 >
                   快速补充
                 </button>
-                {analysis?.is_complete && <span className="quick-status">需求已齐</span>}
+                {analysis?.pending_plan?.review_result.status === "ready_for_confirmation" ? (
+                  <button
+                    type="button"
+                    className="quick-submit"
+                    onClick={handleConfirmPlan}
+                    disabled={isSending || Boolean(failedMessage)}
+                  >
+                    确认方案
+                  </button>
+                ) : (
+                  analysis?.is_complete && <span className="quick-status">需求已齐</span>
+                )}
               </div>
               {isQuickFormOpen && (
                 <div className="quick-form">

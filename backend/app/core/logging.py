@@ -11,6 +11,13 @@ LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
 
+def _configure_third_party_loggers() -> None:
+    """限制可能打印完整请求 URL 的第三方日志级别。"""
+
+    # 第一步：httpx 的 INFO 日志会输出完整查询参数，高德 Key 位于查询参数中，必须禁止写入日志。
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
 def setup_logging() -> None:
     """初始化控制台日志和按大小滚动的文件日志。"""
 
@@ -43,6 +50,8 @@ def setup_logging() -> None:
 
     # 请求访问日志已由 main.py 的中间件统一记录，关闭 Uvicorn 的重复访问日志。
     logging.getLogger("uvicorn.access").disabled = True
+    # 第四步：保留业务工具自己的安全摘要，关闭第三方库可能泄露认证参数的访问日志。
+    _configure_third_party_loggers()
     # 文件变化提示不属于业务日志，且热重载时会产生大量噪声。
     logging.getLogger("watchfiles").setLevel(logging.WARNING)
     logging.getLogger("watchfiles.main").setLevel(logging.WARNING)

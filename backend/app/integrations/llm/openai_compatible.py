@@ -24,6 +24,8 @@ async def request_openai_compatible_chat(
     max_tokens: int | None,
     json_mode: bool,
     debug_log_raw_output: bool = False,
+    disable_thinking: bool = False,
+    enable_thinking: bool = False,
 ) -> str:
     """调用 OpenAI 兼容聊天接口，并返回助手文本回复。"""
 
@@ -71,6 +73,12 @@ async def request_openai_compatible_chat(
     if json_mode:
         # 第四步：请求 OpenAI 兼容供应商强制输出 JSON 对象，降低结构化 Agent 的格式漂移概率。
         payload["response_format"] = {"type": "json_object"}
+    if enable_thinking:
+        # 第五步：审核等高风险调用可显式启用思考，推理内容不会作为助手正文返回。
+        payload["thinking"] = {"type": "enabled"}
+    elif disable_thinking:
+        # 第六步：结构化调用可显式关闭思考，避免推理内容耗尽输出额度而没有正文。
+        payload["thinking"] = {"type": "disabled"}
     # API Key 仅放入请求头，不写入日志、错误详情或响应体。
     headers = {"Authorization": f"Bearer {api_key}"}
     url = f"{base_url.rstrip('/')}/chat/completions"

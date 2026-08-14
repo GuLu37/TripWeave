@@ -57,12 +57,44 @@ class TripRequirements(BaseModel):
     fixed_schedule: list[str] = Field(default_factory=list)
 
 
+class ValidationIssue(BaseModel):
+    """确定性规则校验发现的一项问题。"""
+
+    code: str = Field(min_length=1, max_length=100)
+    message: str = Field(min_length=1, max_length=1_000)
+    severity: Literal["error", "warning"]
+    retryable: bool = False
+
+
+class ReviewResult(BaseModel):
+    """审核总结 Agent 输出的方案状态与用户可读结论。"""
+
+    status: Literal[
+        "ready_for_confirmation",
+        "needs_replanning",
+        "needs_user_decision",
+    ]
+    summary: str = Field(min_length=1, max_length=4_000)
+    risks: list[str] = Field(default_factory=list, max_length=20)
+    pending_items: list[str] = Field(default_factory=list, max_length=20)
+
+
+class TripPlanSnapshot(BaseModel):
+    """浏览器在待确认阶段保存并回传的完整方案快照。"""
+
+    requirements: TripRequirements
+    proposal: str = Field(min_length=1, max_length=20_000)
+    review_result: ReviewResult
+
+
 class ChatRequest(BaseModel):
     """聊天接口接收的请求。"""
 
     messages: list[ClientChatMessage] = Field(min_length=1, max_length=40)
     # 浏览器保存的上轮已确认需求，用于在截短历史后维持旅差上下文。
     known_requirements: TripRequirements | None = None
+    # 浏览器保存待确认方案，用于下一轮识别确认、修改并向规划 Agent 提供重规划上下文。
+    pending_plan: TripPlanSnapshot | None = None
 
 
 class ConversationAnalysis(BaseModel):
@@ -71,6 +103,10 @@ class ConversationAnalysis(BaseModel):
     intent: Literal["chat", "trip_planning"]
     reply: str = Field(min_length=1, max_length=4_000)
     requirements: TripRequirements | None = None
+    # 由统一入口 Agent 判断当前旅差会话是首次规划、修改方案还是确认方案。
+    plan_action: Literal["plan", "modify", "confirm"] | None = None
+    # 仅由 LangGraph 写入，前端在下一轮请求中原样提交以恢复待确认状态。
+    pending_plan: TripPlanSnapshot | None = None
     # 以下两项由入口 Agent 根据 requirements 的本地规则计算，不依赖模型判断。
     missing_fields: list[str] = Field(default_factory=list)
     is_complete: bool | None = None
@@ -82,6 +118,8 @@ class ConversationAnalysis(BaseModel):
         # 第一步：普通聊天不得混入行程需求，避免下游误进入规划分支。
         if self.intent == "chat" and self.requirements is not None:
             raise ValueError("chat 意图不能包含 requirements。")
+        if self.intent == "chat" and self.plan_action is not None:
+            raise ValueError("chat 意图不能包含 plan_action。")
         # 第二步：旅差规划必须带结构化需求，缺失时交由入口 Agent 触发重试。
         if self.intent == "trip_planning" and self.requirements is None:
             raise ValueError("trip_planning 意图必须包含 requirements。")
