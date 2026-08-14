@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+backend/.venv/
 venv/
 .pytest_cache/
 .mypy_cache/
@@ -10,11 +11,15 @@ venv/
 # Environment and secrets
 .env
 .env.*
+backend/.env
 !.env.example
+!backend/.env.example
 
 # Node.js
 node_modules/
+frontend/node_modules/
 dist/
+frontend/dist/
 coverage/
 
 # IDE and operating system
@@ -27,11 +32,5 @@ Thumbs.db
 data/
 logs/
 *.log
-.env
-backend/.env
-.venv/
-backend/.venv/
-frontend/node_modules/
-frontend/dist/
-__pycache__/
-*.py[cod]
+backend/app/logs/*
+!backend/app/logs/.gitkeep
