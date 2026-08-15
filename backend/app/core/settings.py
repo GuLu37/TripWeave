@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -40,6 +41,14 @@ class Settings(BaseSettings):
     qweather_api_host: str | None = None
     # API Key 仅由后端通过 X-QW-Api-Key 请求头发送，禁止暴露给浏览器。
     qweather_api_key: str | None = None
+    # 浏览器查询由 MCP Tool 执行，本地不直接抓取网站。
+    browser_search_provider: Literal["mcp"] = "mcp"
+    browser_search_timeout_seconds: float = Field(default=90, gt=0, le=300)
+    mcp_server_url: str | None = None
+    mcp_auth_token: str | None = None
+    mcp_protocol_version: str = Field(default="2025-06-18", min_length=1)
+    mcp_max_steps: int = Field(default=12, ge=1, le=30)
+    mcp_max_observation_chars: int = Field(default=12_000, ge=1_000, le=50_000)
     cors_allow_origins: str = Field(min_length=1)
     log_max_bytes: int = Field(default=1_048_576, ge=1)
     log_backup_count: int = Field(default=5, ge=1)

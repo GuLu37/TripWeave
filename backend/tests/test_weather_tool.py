@@ -9,12 +9,12 @@ from app.tools.weather_tool import QWeatherTool
 
 
 class QWeatherToolTests(unittest.IsolatedAsyncioTestCase):
-    """验证天气工具使用专属 Host、API Key 请求头与官方端点。"""
+    """验证天气工具使用专属 Host、API Key 请求头与 v7 官方端点。"""
 
-    async def test_daily_forecast_uses_coordinate_endpoint_and_api_key_header(
+    async def test_daily_forecast_uses_v7_location_query_and_api_key_header(
         self,
     ) -> None:
-        """每日预报应将高德坐标转为纬度在前的官方路径。"""
+        """每日预报应将高德坐标转为 location 查询参数。"""
 
         captured_request: httpx.Request | None = None
 
@@ -26,7 +26,7 @@ class QWeatherToolTests(unittest.IsolatedAsyncioTestCase):
             captured_request = request
             return httpx.Response(
                 200,
-                json={"metadata": {"attributions": []}, "days": []},
+                json={"code": "200", "daily": []},
             )
 
         tool = QWeatherTool(
@@ -42,6 +42,7 @@ class QWeatherToolTests(unittest.IsolatedAsyncioTestCase):
                 days=3,
             )
 
+        self.assertEqual(result["daily"], [])
         self.assertEqual(result["days"], [])
         output = "\n".join(logs.output)
         self.assertIn("天气工具开始查询：operation=daily", output)
@@ -52,16 +53,45 @@ class QWeatherToolTests(unittest.IsolatedAsyncioTestCase):
         assert captured_request is not None
         self.assertEqual(
             captured_request.url.path,
-            "/weather/v1/daily/39.92/116.41",
+            "/v7/weather/3d",
         )
-        self.assertEqual(captured_request.url.params["days"], "3")
+        self.assertEqual(captured_request.url.params["location"], "116.41,39.92")
         self.assertEqual(captured_request.url.params["lang"], "zh")
-        self.assertEqual(captured_request.url.params["localTime"], "true")
         self.assertEqual(
             captured_request.headers["X-QW-Api-Key"],
             "test-weather-key",
         )
         self.assertNotIn("key", captured_request.url.params)
+
+    async def test_daily_forecast_maps_requested_days_to_supported_v7_endpoint(
+        self,
+    ) -> None:
+        """每日预报应使用覆盖请求范围的最小 v7 天数端点。"""
+
+        captured_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            """记录不同业务天数对应的 v7 路径。"""
+
+            # 第一步：收集请求路径，确认 1/4/8 天分别映射到 3/7/10 天端点。
+            captured_paths.append(request.url.path)
+            return httpx.Response(200, json={"code": "200", "daily": []})
+
+        tool = QWeatherTool(
+            api_key="test-weather-key",
+            api_host="demo.qweatherapi.com",
+            transport=httpx.MockTransport(handler),
+        )
+
+        # 第二步：逐一验证规划层常用的三个日期档位。
+        await tool.get_daily_forecast("116.407,39.918", days=1)
+        await tool.get_daily_forecast("116.407,39.918", days=4)
+        await tool.get_daily_forecast("116.407,39.918", days=8)
+
+        self.assertEqual(
+            captured_paths,
+            ["/v7/weather/3d", "/v7/weather/7d", "/v7/weather/10d"],
+        )
 
     async def test_hourly_forecast_validates_requested_hour_range(self) -> None:
         """逐小时预报应在请求前拒绝超过官方上限的小时数。"""
@@ -82,8 +112,38 @@ class QWeatherToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.exception.code, "QWEATHER_PARAMETER_INVALID")
         self.assertEqual(context.exception.details, {"parameter": "hours"})
 
+    async def test_hourly_forecast_maps_requested_hours_to_supported_v7_endpoint(
+        self,
+    ) -> None:
+        """逐小时预报应使用覆盖请求范围的最小 v7 小时端点。"""
+
+        captured_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            """记录不同业务小时数对应的 v7 路径。"""
+
+            # 第一步：收集请求路径，确认 25/73/169 小时分别映射到 72/168/240 小时。
+            captured_paths.append(request.url.path)
+            return httpx.Response(200, json={"code": "200", "hourly": []})
+
+        tool = QWeatherTool(
+            api_key="test-weather-key",
+            api_host="demo.qweatherapi.com",
+            transport=httpx.MockTransport(handler),
+        )
+
+        # 第二步：逐一验证 v7 逐小时预报的固定端点。
+        await tool.get_hourly_forecast("116.407,39.918", hours=25)
+        await tool.get_hourly_forecast("116.407,39.918", hours=73)
+        await tool.get_hourly_forecast("116.407,39.918", hours=169)
+
+        self.assertEqual(
+            captured_paths,
+            ["/v7/weather/72h", "/v7/weather/168h", "/v7/weather/240h"],
+        )
+
     async def test_alerts_reorder_coordinates_for_official_path(self) -> None:
-        """天气预警接口应将输入经纬度重排为纬度、经度路径参数。"""
+        """天气预警接口应将高德坐标转换为 v7 location 查询参数。"""
 
         def handler(request: httpx.Request) -> httpx.Response:
             """模拟无生效预警的官方响应。"""
@@ -91,12 +151,10 @@ class QWeatherToolTests(unittest.IsolatedAsyncioTestCase):
             # 第一步：确认路径按官方预警接口的纬度、经度顺序构造。
             self.assertEqual(
                 request.url.path,
-                "/weatheralert/v1/current/39.92/116.41",
+                "/v7/warning/now",
             )
-            return httpx.Response(
-                200,
-                json={"metadata": {"zeroResult": True, "attributions": []}},
-            )
+            self.assertEqual(request.url.params["location"], "116.41,39.92")
+            return httpx.Response(200, json={"code": "200", "warning": []})
 
         tool = QWeatherTool(
             api_key="test-weather-key",
@@ -106,7 +164,7 @@ class QWeatherToolTests(unittest.IsolatedAsyncioTestCase):
 
         # 第二步：调用预警查询并确认成功结果不被误判为空响应。
         result = await tool.get_weather_alerts("116.407,39.918")
-        self.assertTrue(result["metadata"]["zeroResult"])
+        self.assertEqual(result["warning"], [])
 
     async def test_missing_metadata_with_provider_code_is_mapped_to_business_error(
         self,

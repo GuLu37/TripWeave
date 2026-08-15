@@ -1,5 +1,6 @@
 """TripWeave 的 Pydantic 数据契约。"""
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -19,6 +20,17 @@ class ClientChatMessage(BaseModel):
     # 禁止客户端提交 system 角色，防止覆盖后端固定注入的全局提示词。
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=12_000)
+
+
+class ShortTermMemory(BaseModel):
+    """浏览器与后端之间传递的短期记忆快照。"""
+
+    # 摘要承载滑动窗口之外的历史事实，后续可替换为数据库记忆引用。
+    summary: str | None = Field(default=None, max_length=4_000)
+    recent_messages: list[ClientChatMessage] = Field(
+        default_factory=list,
+        max_length=8,
+    )
 
 
 class HealthResponse(BaseModel):
@@ -87,10 +99,18 @@ class TripPlanSnapshot(BaseModel):
     review_result: ReviewResult
 
 
+class ConfirmedTripPlan(TripPlanSnapshot):
+    """用户确认后的行程方案结果，后续可直接映射到长期存储。"""
+
+    confirmed_at: datetime
+
+
 class ChatRequest(BaseModel):
     """聊天接口接收的请求。"""
 
     messages: list[ClientChatMessage] = Field(min_length=1, max_length=40)
+    # 短期记忆由前端回传，后端每轮合并并返回更新后的快照。
+    short_term_memory: ShortTermMemory | None = None
     # 浏览器保存的上轮已确认需求，用于在截短历史后维持旅差上下文。
     known_requirements: TripRequirements | None = None
     # 浏览器保存待确认方案，用于下一轮识别确认、修改并向规划 Agent 提供重规划上下文。
@@ -100,13 +120,20 @@ class ChatRequest(BaseModel):
 class ConversationAnalysis(BaseModel):
     """统一对话入口 Agent 的结构化输出。"""
 
-    intent: Literal["chat", "trip_planning"]
+    intent: Literal[
+        "chat",
+        "trip_planning",
+        "accommodation_search",
+        "intercity_transport_search",
+    ]
     reply: str = Field(min_length=1, max_length=4_000)
     requirements: TripRequirements | None = None
     # 由统一入口 Agent 判断当前旅差会话是首次规划、修改方案还是确认方案。
     plan_action: Literal["plan", "modify", "confirm"] | None = None
     # 仅由 LangGraph 写入，前端在下一轮请求中原样提交以恢复待确认状态。
     pending_plan: TripPlanSnapshot | None = None
+    # 用户确认成功后写入，后续接入数据库时可作为持久化载荷。
+    confirmed_plan: ConfirmedTripPlan | None = None
     # 以下两项由入口 Agent 根据 requirements 的本地规则计算，不依赖模型判断。
     missing_fields: list[str] = Field(default_factory=list)
     is_complete: bool | None = None
@@ -123,6 +150,12 @@ class ConversationAnalysis(BaseModel):
         # 第二步：旅差规划必须带结构化需求，缺失时交由入口 Agent 触发重试。
         if self.intent == "trip_planning" and self.requirements is None:
             raise ValueError("trip_planning 意图必须包含 requirements。")
+        # 第三步：直接查询也必须带需求对象，字段暂不完整时用于生成追问。
+        if self.intent in {
+            "accommodation_search",
+            "intercity_transport_search",
+        } and self.requirements is None:
+            raise ValueError("直接查询意图必须包含 requirements。")
         return self
 
 
@@ -131,3 +164,5 @@ class ChatResponse(BaseModel):
 
     # analysis.reply 同时是前端展示的助手回复和后续工作流的唯一回复来源。
     analysis: ConversationAnalysis
+    # 返回更新后的短期记忆，前端下一轮只需提交当前消息与该快照。
+    short_term_memory: ShortTermMemory

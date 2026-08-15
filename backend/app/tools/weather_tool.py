@@ -7,8 +7,8 @@
 3. ``get_current_weather`` 用于确认出发前或当日的实时天气。
 4. ``get_weather_alerts`` 用于检查目的地是否存在生效中的极端天气预警。
 
-所有公开方法返回已验证的和风天气原始 JSON。天气数据中的 ``metadata.attributions``
-是供应商要求随数据展示的归因信息，后续展示层应保留该信息。
+所有公开方法返回已验证的和风天气 JSON。工具同时兼容旧版测试桩中的
+``metadata`` 结构，以及当前 v7 接口中的 ``code``、``daily`` 和 ``warning`` 字段。
 """
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -17,6 +17,7 @@ from typing import Literal
 
 import httpx
 
+from app.api.exception.error_handler import record_error
 from app.api.exception.exceptions import QWeatherException
 from app.core.settings import get_settings
 
@@ -106,11 +107,13 @@ class QWeatherTool:
             ```
         """
 
-        # 第一步：标准化坐标与语言后，调用和风天气的 1 公里分辨率实时天气端点。
+        # 第一步：标准化坐标与语言后，使用 v7 实时天气端点和 location 查询参数。
         latitude, longitude = _require_coordinate(location)
+        query_params = _build_query_params(language)
+        query_params["location"] = f"{longitude},{latitude}"
         return await self._request(
-            f"/weather/v1/current/{latitude}/{longitude}",
-            _build_query_params(language, local_time),
+            "/v7/weather/now",
+            query_params,
         )
 
     async def get_daily_forecast(
@@ -147,17 +150,20 @@ class QWeatherTool:
             ```
         """
 
-        # 第一步：在请求前限制官方支持的预报天数，避免供应商返回难以解释的参数错误。
+        # 第一步：在请求前限制规划层允许的预报范围，避免把无效天数交给供应商。
         if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= 10:
             raise QWeatherException.invalid_parameter("days")
         latitude, longitude = _require_coordinate(location)
-        query_params = _build_query_params(language, local_time)
-        query_params["days"] = str(days)
-        # 第二步：使用精确坐标每日预报端点，为景点安排提供可比较的未来天气依据。
-        return await self._request(
-            f"/weather/v1/daily/{latitude}/{longitude}",
+        query_params = _build_query_params(language)
+        query_params["location"] = f"{longitude},{latitude}"
+        # 第二步：将业务所需天数映射为 v7 支持的 3、7、10 天端点。
+        endpoint_days = _select_daily_endpoint_days(days)
+        payload = await self._request(
+            f"/v7/weather/{endpoint_days}d",
             query_params,
         )
+        # 第三步：只保留调用方请求的天数，并提供旧版 days 别名供规划层兼容读取。
+        return _limit_daily_forecast(payload, days)
 
     async def get_hourly_forecast(
         self,
@@ -193,7 +199,7 @@ class QWeatherTool:
             ```
         """
 
-        # 第一步：在请求前限制官方支持的小时范围，避免模型请求把无效参数交给供应商。
+        # 第一步：在请求前限制规划层允许的小时范围，避免模型请求把无效参数交给供应商。
         if (
             not isinstance(hours, int)
             or isinstance(hours, bool)
@@ -201,11 +207,12 @@ class QWeatherTool:
         ):
             raise QWeatherException.invalid_parameter("hours")
         latitude, longitude = _require_coordinate(location)
-        query_params = _build_query_params(language, local_time)
-        query_params["hours"] = str(hours)
-        # 第二步：使用精确坐标小时预报端点，为出行时段和室内备选安排提供依据。
+        query_params = _build_query_params(language)
+        query_params["location"] = f"{longitude},{latitude}"
+        # 第二步：将业务所需小时数映射为 v7 支持的 24、72、168、240 小时端点。
+        endpoint_hours = _select_hourly_endpoint_hours(hours)
         return await self._request(
-            f"/weather/v1/hourly/{latitude}/{longitude}",
+            f"/v7/weather/{endpoint_hours}h",
             query_params,
         )
 
@@ -239,12 +246,14 @@ class QWeatherTool:
             ```
         """
 
-        # 第一步：从“经度,纬度”输入拆分出预警接口规定的“纬度/经度”路径参数。
+        # 第一步：标准化经纬度并转换为 v7 预警接口所需的 location 查询参数。
         latitude, longitude = _require_coordinate(location)
+        query_params = _build_query_params(language)
+        query_params["location"] = f"{longitude},{latitude}"
         # 第二步：仅查询当前生效预警，避免将历史或失效事件误写入旅行风险提示。
         return await self._request(
-            f"/weatheralert/v1/current/{latitude}/{longitude}",
-            _build_query_params(language, local_time),
+            "/v7/warning/now",
+            query_params,
         )
 
     async def _request(
@@ -261,20 +270,37 @@ class QWeatherTool:
             for setting_name, value in {
                 "QWEATHER_API_HOST": self._api_host,
                 "QWEATHER_API_KEY": self._api_key,
-            }.items()
+        }.items()
             if not value or not value.strip()
         ]
         if missing_settings:
-            logger.warning(
-                "天气工具配置缺失：operation=%s missing_settings=%s",
-                operation,
-                ",".join(missing_settings),
+            error = QWeatherException.config_missing("、".join(missing_settings))
+            record_error(
+                error,
+                component="tool",
+                source="weather_tool",
+                operation=f"weather.{operation}",
+                context={
+                    "missing_settings": missing_settings,
+                    "degraded": True,
+                },
+                default_code="QWEATHER_CONFIG_MISSING",
+                default_message="天气工具配置不完整，无法查询天气。",
             )
-            raise QWeatherException.config_missing("、".join(missing_settings))
+            raise error
 
         try:
             base_url = _normalize_api_host(self._api_host)
-        except QWeatherException:
+        except QWeatherException as error:
+            record_error(
+                error,
+                component="tool",
+                source="weather_tool",
+                operation=f"weather.{operation}",
+                context={"degraded": True},
+                default_code="QWEATHER_PARAMETER_INVALID",
+                default_message="天气工具请求参数无效，无法查询天气。",
+            )
             raise
 
         try:
@@ -283,7 +309,7 @@ class QWeatherTool:
                 "天气工具开始查询：operation=%s language=%s local_time=%s forecast_size=%s",
                 operation,
                 params.get("lang"),
-                params.get("localTime"),
+                "provider_local_time",
                 params.get("days") or params.get("hours"),
             )
             # 第二步：使用官方推荐的 X-QW-Api-Key 请求头认证，避免 Key 出现在 URL、日志或缓存键中。
@@ -297,81 +323,118 @@ class QWeatherTool:
                 response.raise_for_status()
         except httpx.HTTPStatusError as error:
             # 第三步：只保留安全的 HTTP 状态码，不能记录带认证头的完整请求。
-            logger.warning(
-                "天气工具请求被拒绝：operation=%s upstream_status_code=%s",
-                operation,
-                error.response.status_code,
+            tool_error = QWeatherException.api_rejected(
+                error.response.status_code
             )
-            raise QWeatherException.api_rejected(error.response.status_code) from error
+            record_error(
+                tool_error,
+                component="tool",
+                source="weather_tool",
+                operation=f"weather.{operation}",
+                context={
+                    "upstream_status_code": error.response.status_code,
+                    "degraded": True,
+                },
+                default_code="QWEATHER_API_REJECTED",
+                default_message="天气服务拒绝了本次查询。",
+            )
+            raise tool_error from error
         except httpx.HTTPError as error:
             # 第四步：网络、超时与协议异常交由后续 ToolExecutor 统一决定是否重试。
-            logger.warning(
-                "天气工具请求不可达：operation=%s error_type=%s",
-                operation,
-                type(error).__name__,
+            tool_error = QWeatherException.api_unreachable()
+            record_error(
+                tool_error,
+                component="tool",
+                source="weather_tool",
+                operation=f"weather.{operation}",
+                context={"degraded": True},
+                default_code="QWEATHER_API_UNREACHABLE",
+                default_message="天气服务暂时不可达。",
             )
-            raise QWeatherException.api_unreachable() from error
+            raise tool_error from error
 
         try:
             payload = response.json()
         except (TypeError, ValueError) as error:
             # 第五步：天气响应必须是 JSON 对象，非结构化正文不能进入规划 Agent 上下文。
-            logger.warning(
-                "天气工具响应非 JSON：operation=%s",
-                operation,
+            tool_error = QWeatherException.bad_response()
+            record_error(
+                tool_error,
+                component="tool",
+                source="weather_tool",
+                operation=f"weather.{operation}",
+                context={"response_shape": "non_json", "degraded": True},
+                default_code="QWEATHER_API_BAD_RESPONSE",
+                default_message="天气服务返回了无法识别的响应。",
             )
-            raise QWeatherException.bad_response() from error
+            raise tool_error from error
         if not isinstance(payload, dict):
-            logger.warning(
-                "天气工具响应非对象：operation=%s response_type=%s",
-                operation,
-                type(payload).__name__,
+            tool_error = QWeatherException.bad_response()
+            record_error(
+                tool_error,
+                component="tool",
+                source="weather_tool",
+                operation=f"weather.{operation}",
+                context={
+                    "response_shape": type(payload).__name__,
+                    "degraded": True,
+                },
+                default_code="QWEATHER_API_BAD_RESPONSE",
+                default_message="天气服务返回了无法识别的响应。",
             )
-            raise QWeatherException.bad_response()
+            raise tool_error
 
-        # 第六步：新版天气与预警成功响应都包含 metadata；兼容供应商错误对象中的 code 字段。
-        metadata = payload.get("metadata")
-        if not isinstance(metadata, dict):
-            if "code" in payload:
-                logger.warning(
-                    "天气工具业务响应失败：operation=%s provider_code=%s",
-                    operation,
-                    payload.get("code"),
-                )
-                raise QWeatherException.business_rejected(payload.get("code"))
-            logger.warning(
-                "天气工具响应缺少 metadata：operation=%s",
-                operation,
+        # 第六步：v7 成功响应通过 code=200 表示成功；旧版测试桩仍可使用 metadata。
+        provider_code = payload.get("code")
+        if provider_code is not None and str(provider_code) != "200":
+            tool_error = QWeatherException.business_rejected(provider_code)
+            record_error(
+                tool_error,
+                component="tool",
+                source="weather_tool",
+                operation=f"weather.{operation}",
+                context={"provider_code": str(provider_code), "degraded": True},
+                default_code="QWEATHER_BUSINESS_REJECTED",
+                default_message="天气服务未能完成本次查询。",
             )
-            raise QWeatherException.bad_response()
+            raise tool_error
+        metadata = payload.get("metadata")
+        if provider_code is None and not isinstance(metadata, dict):
+            tool_error = QWeatherException.bad_response()
+            record_error(
+                tool_error,
+                component="tool",
+                source="weather_tool",
+                operation=f"weather.{operation}",
+                context={"missing_field": "metadata", "degraded": True},
+                default_code="QWEATHER_API_BAD_RESPONSE",
+                default_message="天气服务响应缺少必要字段。",
+            )
+            raise tool_error
         # 第七步：记录结果规模和预警空结果状态，便于维护时判断数据是否符合预期。
         logger.info(
             "天气工具查询完成：operation=%s result_count=%s zero_result=%s",
             operation,
             _get_result_count(operation, payload),
-            metadata.get("zeroResult"),
+            metadata.get("zeroResult") if isinstance(metadata, dict) else None,
         )
         return payload
 
 
 def _build_query_params(
     language: WeatherLanguage,
-    local_time: bool,
 ) -> dict[str, str]:
-    """构造各天气端点共享的语言与本地时间查询参数。"""
+    """构造各天气端点共享的语言查询参数。"""
 
     # 第一步：仅接受当前工具公开的语言枚举，避免无效语言参数被错误地视为成功天气数据。
     if language not in {"zh", "en"}:
         raise QWeatherException.invalid_parameter("language")
-    # 第二步：显式传递本地时间开关，确保行程日期和小时不会因默认 UTC 发生错位。
-    return {
-        "lang": language,
-        "localTime": str(local_time).lower(),
-    }
+    # 第二步：v7 接口按目的地本地时间返回结果，不再发送旧版 localTime 参数。
+    return {"lang": language}
 
 
 def _require_coordinate(location: str) -> tuple[str, str]:
-    """将高德坐标标准化为和风天气使用的“纬度、经度”路径参数。"""
+    """将高德坐标标准化为和风天气查询所需的“纬度、经度”内部表示。"""
 
     # 第一步：接收高德一致的“经度,纬度”文本，拒绝地址、空值和缺少分隔符的输入。
     if not isinstance(location, str):
@@ -427,17 +490,60 @@ def _normalize_api_host(api_host: str | None) -> str:
     return base_url
 
 
+def _select_daily_endpoint_days(days: int) -> int:
+    """将业务预报天数映射为和风天气 v7 支持的每日端点。"""
+
+    # 第一步：v7 不支持任意 N 天路径，使用覆盖请求范围的最小官方端点。
+    if days <= 3:
+        return 3
+    if days <= 7:
+        return 7
+    return 10
+
+
+def _select_hourly_endpoint_hours(hours: int) -> int:
+    """将业务预报小时数映射为和风天气 v7 支持的逐小时端点。"""
+
+    # 第一步：v7 逐小时端点按固定档位提供，选择不小于请求范围的最小档位。
+    if hours <= 24:
+        return 24
+    if hours <= 72:
+        return 72
+    if hours <= 168:
+        return 168
+    return 240
+
+
+def _limit_daily_forecast(
+    payload: dict[str, object],
+    days: int,
+) -> dict[str, object]:
+    """裁剪 v7 每日预报并写入旧版 days 兼容字段。"""
+
+    # 第一步：v7 使用 daily，旧版规划层和测试桩使用 days，优先读取供应商原始列表。
+    daily_items = payload.get("daily")
+    if not isinstance(daily_items, list):
+        daily_items = payload.get("days")
+    if not isinstance(daily_items, list):
+        return payload
+    # 第二步：只传递调用方请求的天数，避免 3/7/10 天端点带来无关未来信息。
+    limited_items = daily_items[:days]
+    payload["daily"] = limited_items
+    payload["days"] = limited_items
+    return payload
+
+
 def _get_operation_name(path: str) -> str:
     """将内部请求路径映射为不含坐标的日志操作名称。"""
 
-    # 第一步：仅按固定官方路径识别能力类型，日志中绝不保留动态坐标路径段。
-    if path.startswith("/weather/v1/current/"):
+    # 第一步：仅按固定官方路径识别能力类型，日志中绝不保留动态坐标或查询参数。
+    if path == "/v7/weather/now":
         return "current"
-    if path.startswith("/weather/v1/daily/"):
+    if path.startswith("/v7/weather/") and path.endswith("d"):
         return "daily"
-    if path.startswith("/weather/v1/hourly/"):
+    if path.startswith("/v7/weather/") and path.endswith("h"):
         return "hourly"
-    if path.startswith("/weatheralert/v1/current/"):
+    if path == "/v7/warning/now":
         return "alerts"
     return "unknown"
 
@@ -452,11 +558,24 @@ def _get_result_count(
     list_field_by_operation = {
         "daily": "days",
         "hourly": "hours",
-        "alerts": "alerts",
+        "alerts": "warning",
     }
     list_field = list_field_by_operation.get(operation)
     if list_field is not None:
         result = payload.get(list_field)
+        if result is None:
+            # 第二步：v7 使用 daily、hourly、warning，旧版测试桩使用 days、hours、alerts。
+            fallback_fields = {
+                "daily": "daily",
+                "hourly": "hourly",
+                "alerts": "alerts",
+            }
+            result = payload.get(fallback_fields.get(operation, ""))
         return len(result) if isinstance(result, list) else 0
-    # 第二步：实时天气没有列表结构，仅用 1 或 0 表示是否返回核心天气现象。
-    return 1 if isinstance(payload.get("condition"), dict) else 0
+    # 第二步：v7 实时天气使用 now，旧版测试桩使用 condition，均只记录是否有核心对象。
+    return (
+        1
+        if isinstance(payload.get("now"), dict)
+        or isinstance(payload.get("condition"), dict)
+        else 0
+    )

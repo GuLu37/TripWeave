@@ -9,6 +9,7 @@ import asyncio
 import logging
 
 from app.api.exception.exceptions import AmapException
+from app.api.exception.error_handler import record_error
 from app.tools.map_route_tool import AmapMapRouteTool, RouteMode
 
 _DEFAULT_MODES: tuple[RouteMode, ...] = (
@@ -133,16 +134,29 @@ class TransportPlanningTool:
         unavailable_modes: list[dict[str, str]] = []
         for mode, result in zip(selected_modes, results, strict=True):
             if isinstance(result, AmapException):
+                record_error(
+                    result,
+                    component="tool",
+                    source="transport_tool",
+                    operation=f"plan_route.{mode}",
+                    context={"mode": mode, "degraded": True},
+                    default_code="TRANSPORT_ROUTE_UNAVAILABLE",
+                    default_message="本地交通路线查询失败，已跳过当前出行方式。",
+                )
                 unavailable_modes.append({"mode": mode, "code": result.code})
                 continue
             if isinstance(result, Exception):
-                logger.exception(
-                    "交通规划出现未预期方式异常：mode=%s error_type=%s",
-                    mode,
-                    type(result).__name__,
+                info = record_error(
+                    result,
+                    component="tool",
+                    source="transport_tool",
+                    operation=f"plan_route.{mode}",
+                    context={"mode": mode, "degraded": True},
+                    default_code="TRANSPORT_ROUTE_UNAVAILABLE",
+                    default_message="本地交通路线查询失败，已跳过当前出行方式。",
                 )
                 unavailable_modes.append(
-                    {"mode": mode, "code": "TRANSPORT_ROUTE_UNAVAILABLE"}
+                    {"mode": mode, "code": str(info["code"])}
                 )
                 continue
             options.append(

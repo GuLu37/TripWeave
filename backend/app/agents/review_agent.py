@@ -6,6 +6,7 @@ import logging
 from pydantic import ValidationError
 
 from app.agents.prompts import load_prompt
+from app.api.exception.error_handler import record_error
 from app.api.exception.exceptions import AppException
 from app.core.settings import get_settings
 from app.integrations.llm.client import chat_with_llm
@@ -54,6 +55,7 @@ async def review_trip(
     requirements: TripRequirements,
     proposal: str,
     validation_issues: list[ValidationIssue] | None = None,
+    external_search_evidence: dict[str, object] | None = None,
 ) -> ReviewResult:
     """根据规划草案和确定性校验问题生成审核总结。"""
 
@@ -72,6 +74,7 @@ async def review_trip(
         ),
         "proposal": normalized_proposal,
         "validation_issues": [issue.model_dump() for issue in issues],
+        "external_search_evidence": external_search_evidence or {},
     }
     response_text = await chat_with_llm(
         [
@@ -121,9 +124,13 @@ def _parse_review_result(
         # 第二步：忽略模型可能输出的 status，防止模型越权改变工作流分支。
         return ReviewResult.model_validate({**payload, "status": status})
     except (json.JSONDecodeError, ValidationError, TypeError) as error:
-        logger.warning(
-            "审核总结 Agent 返回结构化数据失败：error_type=%s",
-            type(error).__name__,
+        record_error(
+            error,
+            component="agent",
+            source="review_agent",
+            operation="parse_review_result",
+            default_code="REVIEW_RESULT_INVALID_OUTPUT",
+            default_message="审核总结 Agent 返回结构化数据失败。",
         )
         raise ReviewAgentException.invalid_model_output() from error
 

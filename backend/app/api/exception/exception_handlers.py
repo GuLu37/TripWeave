@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api.exception.exceptions import AppException, ErrorBody, ErrorResponse
+from app.api.exception.error_handler import record_error
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +43,15 @@ async def handle_app_exception(
 ) -> JSONResponse:
     """将自定义业务异常转换为统一错误响应。"""
 
-    # 业务异常预期可控，记录必要请求上下文但不记录密钥和完整对话内容。
-    logger.warning(
-        "业务异常：request_id=%s method=%s path=%s code=%s message=%s",
-        _request_id(request),
-        request.method,
-        request.url.path,
-        exc.code,
-        exc.message,
+    record_error(
+        exc,
+        component="api",
+        source=type(exc).__name__,
+        operation=request.url.path,
+        context={
+            "request_id": _request_id(request),
+            "method": request.method,
+        },
     )
     return build_error_response(
         status_code=exc.status_code,
@@ -75,13 +77,18 @@ async def handle_http_exception(
         code = "HTTP_ERROR"
         message = str(detail)
         details = None
-    logger.warning(
-        "HTTP 异常：request_id=%s method=%s path=%s status_code=%s message=%s",
-        _request_id(request),
-        request.method,
-        request.url.path,
-        exc.status_code,
-        message,
+    record_error(
+        exc,
+        component="api",
+        source="HTTPException",
+        operation=request.url.path,
+        context={
+            "request_id": _request_id(request),
+            "method": request.method,
+            "status_code": exc.status_code,
+        },
+        default_code=code,
+        default_message=message,
     )
     return build_error_response(exc.status_code, code, message, details)
 
@@ -93,12 +100,17 @@ async def handle_request_validation_error(
     """将请求参数校验失败转换为统一错误响应。"""
 
     # 参数校验错误包含字段位置等信息，可安全返回给前端用于提示输入问题。
-    logger.warning(
-        "请求参数校验失败：request_id=%s method=%s path=%s errors=%s",
-        _request_id(request),
-        request.method,
-        request.url.path,
-        exc.errors(),
+    record_error(
+        exc,
+        component="api",
+        source="RequestValidationError",
+        operation=request.url.path,
+        context={
+            "request_id": _request_id(request),
+            "method": request.method,
+        },
+        default_code="REQUEST_VALIDATION_ERROR",
+        default_message="请求参数格式不正确。",
     )
     return build_error_response(
         status_code=422,
@@ -114,12 +126,18 @@ async def handle_unexpected_error(
 ) -> JSONResponse:
     """将未预期异常转换为统一错误响应，避免泄露内部实现。"""
 
-    # 日志保留完整堆栈供排查，响应只暴露通用中文提示。
-    logger.exception(
-        "未预期异常：request_id=%s method=%s path=%s",
-        _request_id(request),
-        request.method,
-        request.url.path,
+    record_error(
+        exc,
+        component="api",
+        source="unhandled_exception",
+        operation=request.url.path,
+        context={
+            "request_id": _request_id(request),
+            "method": request.method,
+        },
+        default_code="INTERNAL_SERVER_ERROR",
+        default_message="服务内部错误，请稍后再试。",
+        level=logging.ERROR,
     )
     return build_error_response(
         status_code=500,

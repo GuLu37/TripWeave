@@ -38,8 +38,17 @@ type ConversationAnalysis = {
   requirements: TripRequirements | null;
   plan_action: "plan" | "modify" | "confirm" | null;
   pending_plan: TripPlanSnapshot | null;
+  confirmed_plan: ConfirmedTripPlan | null;
   missing_fields: string[];
   is_complete: boolean | null;
+};
+
+type ShortTermMemory = {
+  summary: string | null;
+  recent_messages: Array<{
+    role: Role;
+    content: string;
+  }>;
 };
 
 type ReviewResult = {
@@ -55,8 +64,13 @@ type TripPlanSnapshot = {
   review_result: ReviewResult;
 };
 
+type ConfirmedTripPlan = TripPlanSnapshot & {
+  confirmed_at: string;
+};
+
 type ChatApiResponse = {
   analysis: ConversationAnalysis;
+  short_term_memory: ShortTermMemory;
 };
 
 type ChatApiError = {
@@ -79,7 +93,6 @@ type QuickForm = {
 };
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
-const CONTEXT_MESSAGE_LIMIT = 8;
 const TRANSPORT_OPTIONS = ["高铁", "飞机", "自驾"];
 const INTEREST_OPTIONS = ["人文历史", "亲子", "美食", "自然风光"];
 
@@ -131,6 +144,8 @@ function App() {
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState("");
   const [analysis, setAnalysis] = useState<ConversationAnalysis | null>(null);
+  const [tripContext, setTripContext] = useState<ConversationAnalysis | null>(null);
+  const [shortTermMemory, setShortTermMemory] = useState<ShortTermMemory | null>(null);
   const [isQuickFormOpen, setIsQuickFormOpen] = useState(false);
   const [quickForm, setQuickForm] = useState<QuickForm>(createEmptyQuickForm);
   const nextMessageId = useRef(0);
@@ -169,20 +184,22 @@ function App() {
     setError("");
     setIsSending(true);
     try {
+      const pendingMessage = nextMessages.find(
+        (message) => message.id === pendingMessageId,
+      );
+      if (!pendingMessage) throw new Error("找不到待发送消息。");
       const response = await fetch(`${API_BASE_URL}/api/v1/chat/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          // 第一步：只传输近期对话，避免会话变长后每次请求重复携带全部文本。
-          messages: nextMessages
-            .slice(-CONTEXT_MESSAGE_LIMIT)
-            .map(({ role, content }) => ({ role, content })),
-          // 第二步：旅差场景补充上轮确认的结构化需求，保证截短历史后仍保留关键条件。
-          known_requirements: analysis?.intent === "trip_planning"
-            ? analysis.requirements
-            : undefined,
-          // 第三步：待确认方案随下一轮提交，后端可判断用户是在确认还是修改上一版方案。
-          pending_plan: analysis?.pending_plan ?? undefined,
+          // 第一步：只发送当前消息，近期窗口和历史摘要由后端短期记忆统一管理。
+          messages: [{ role: pendingMessage.role, content: pendingMessage.content }],
+          // 第二步：回传上一轮短期记忆，后端合并后自动更新窗口和摘要。
+          short_term_memory: shortTermMemory ?? undefined,
+          // 第三步：旅差场景补充上轮确认的结构化需求，保证记忆截短后仍保留关键条件。
+          known_requirements: tripContext?.requirements ?? undefined,
+          // 第四步：普通聊天不会清除最近一次旅差上下文，后续修改仍能恢复结构化需求。
+          pending_plan: tripContext?.pending_plan ?? undefined,
         }),
       });
       const data = await response.json().catch(() => null) as ChatApiResponse | ChatApiError | null;
@@ -191,7 +208,13 @@ function App() {
         const errorMessage = data && "error" in data ? data.error?.message : undefined;
         throw new Error(errorMessage || "暂时无法获取回复。");
       }
-      if (!data || !("analysis" in data) || !data.analysis) {
+      if (
+        !data
+        || !("analysis" in data)
+        || !data.analysis
+        || !("short_term_memory" in data)
+        || !data.short_term_memory
+      ) {
         throw new Error("对话服务返回的数据不完整。");
       }
 
@@ -207,8 +230,12 @@ function App() {
           content: data.analysis.reply,
         },
       ]);
-      // 第一步：保存后端已校验的分析结果，作为快捷补充面板的唯一状态来源。
+      // 第一步：保存后端已校验的分析结果和短期记忆快照。
       setAnalysis(data.analysis);
+      if (data.analysis.intent === "trip_planning") {
+        setTripContext(data.analysis);
+      }
+      setShortTermMemory(data.short_term_memory);
     } catch (requestError) {
       // 第一步：保留失败的用户消息供重试展示，但后续新消息不会带入请求上下文。
       setMessages((current) =>

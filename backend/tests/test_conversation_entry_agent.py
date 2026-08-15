@@ -7,10 +7,16 @@ from unittest.mock import AsyncMock, patch
 
 from app.agents.conversation_entry_agent import (
     ConversationAnalysisException,
+    IntentDecision,
     _build_conversation_system_prompt,
     _merge_requirements,
     _normalize_trip_dates,
     _parse_conversation_payload,
+    _resolve_intent_with_rules,
+    _scan_intent_tags,
+    analyze_intent,
+    analyze_requirements,
+    analyze_search_requirements,
     analyze_conversation,
 )
 from app.agents.prompts import load_prompt
@@ -88,6 +94,408 @@ class ConversationEntryAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(analysis.is_complete)
         self.assertEqual(analysis.missing_fields, [])
         self.assertEqual(chat_with_llm.call_args.kwargs["max_tokens"], 1024)
+
+    async def test_intent_and_requirement_nodes_run_as_separate_steps(self) -> None:
+        """意图节点与需求节点应分别返回最小结果和完整需求。"""
+
+        intent_response = (
+            '{"intent":"trip_planning","plan_action":"plan",'
+            '"reply":"开始分析需求"}'
+        )
+        requirement_response = """
+        {
+          "intent": "trip_planning",
+          "reply": "需求已整理，进入规划。",
+          "requirements": {
+            "destination": "北京",
+            "departure_date": "2026-09-01",
+            "trip_duration": {
+              "raw_text": "3天",
+              "amount": 3,
+              "unit": "day",
+              "is_approximate": false
+            },
+            "traveler_count": 1
+          }
+        }
+        """
+        # 第一步：让两个节点分别接收各自的结构化模型结果。
+        with patch(
+            "app.agents.conversation_entry_agent.chat_with_llm",
+            new_callable=AsyncMock,
+            side_effect=[intent_response, requirement_response],
+        ):
+            intent = await analyze_intent(
+                [ClientChatMessage(role="user", content="一个人去北京三天")]
+            )
+            analysis = await analyze_requirements(
+                [ClientChatMessage(role="user", content="一个人去北京三天")],
+                intent=intent,
+            )
+
+        # 第二步：确认意图结果不携带需求，需求节点才生成完整性结果。
+        self.assertIsInstance(intent, IntentDecision)
+        self.assertEqual(intent.intent, "trip_planning")
+        self.assertTrue(analysis.is_complete)
+        self.assertEqual(analysis.requirements.destination, "北京")
+
+    async def test_uncertain_model_intent_falls_back_to_trip_rules(self) -> None:
+        """模型返回 uncertain 时，规则层应识别完整旅行句子。"""
+
+        with patch(
+            "app.agents.conversation_entry_agent.chat_with_llm",
+            new_callable=AsyncMock,
+            return_value=(
+                '{"intent":"uncertain","plan_action":null,'
+                '"reply":"无法确定"}'
+            ),
+        ):
+            intent = await analyze_intent(
+                [
+                    ClientChatMessage(
+                        role="user",
+                        content="我和家里人五个人计划下周一从广州出发到北京旅游三天",
+                    )
+                ]
+            )
+
+        self.assertEqual(intent.intent, "trip_planning")
+        self.assertEqual(intent.plan_action, "plan")
+
+    async def test_intent_model_failure_falls_back_to_pending_confirmation(self) -> None:
+        """模型调用失败时，规则层应识别待确认方案的确认动作。"""
+
+        pending_plan = TripPlanSnapshot(
+            requirements=TripRequirements(destination="北京"),
+            proposal="## 行程概览\n北京三日游",
+            review_result=ReviewResult(
+                status="ready_for_confirmation",
+                summary="审核完成。",
+            ),
+        )
+        with patch(
+            "app.agents.conversation_entry_agent.chat_with_llm",
+            new_callable=AsyncMock,
+            side_effect=ModelException.fallback_exhausted([]),
+        ):
+            intent = await analyze_intent(
+                [ClientChatMessage(role="user", content="就这样确认")],
+                pending_plan=pending_plan,
+            )
+
+        self.assertEqual(intent.intent, "trip_planning")
+        self.assertEqual(intent.plan_action, "confirm")
+
+    def test_rule_layer_scans_full_sentence_with_lightweight_constraints(self) -> None:
+        """规则层应识别完整旅行句式，并避免单个地点词触发规划。"""
+
+        self.assertEqual(
+            _scan_intent_tags("我计划下周一从广州出发去北京旅游三天"),
+            {"trip_action", "trip_detail"},
+        )
+        self.assertEqual(
+            _resolve_intent_with_rules(
+                [ClientChatMessage(role="user", content="北京有什么景点？")],
+                known_requirements=None,
+                pending_plan=None,
+            ).intent,
+            "chat",
+        )
+        self.assertEqual(
+            _resolve_intent_with_rules(
+                [
+                    ClientChatMessage(
+                        role="user",
+                        content="今天晚上广州天气怎样",
+                    )
+                ],
+                known_requirements=TripRequirements(destination="北京"),
+                pending_plan=None,
+            ).intent,
+            "chat",
+        )
+        self.assertEqual(
+            _resolve_intent_with_rules(
+                [
+                    ClientChatMessage(
+                        role="user",
+                        content="帮我查北京酒店一晚多少钱",
+                    )
+                ],
+                known_requirements=None,
+                pending_plan=None,
+            ).intent,
+            "accommodation_search",
+        )
+        self.assertEqual(
+            _resolve_intent_with_rules(
+                [
+                    ClientChatMessage(
+                        role="user",
+                        content="查一下广州到北京明天有哪些高铁",
+                    )
+                ],
+                known_requirements=None,
+                pending_plan=None,
+            ).intent,
+            "intercity_transport_search",
+        )
+        self.assertEqual(
+            _resolve_intent_with_rules(
+                [
+                    ClientChatMessage(
+                        role="user",
+                        content="查一下广州到北京的航班和机票价格",
+                    )
+                ],
+                known_requirements=None,
+                pending_plan=None,
+            ).intent,
+            "intercity_transport_search",
+        )
+
+    async def test_direct_transport_search_extracts_minimum_requirements(self) -> None:
+        """直接铁路查询只收集路线和日期，不进入行程规划。"""
+
+        intent_response = (
+            '{"intent":"intercity_transport_search","plan_action":null,'
+            '"reply":"开始查询铁路班次信息"}'
+        )
+        requirement_response = """
+        {
+          "intent": "intercity_transport_search",
+          "reply": "正在查询广州到北京的铁路班次。",
+          "requirements": {
+            "origin": "广州",
+            "destination": "北京",
+            "departure_date": "2026-08-16"
+          }
+        }
+        """
+        with patch(
+            "app.agents.conversation_entry_agent.chat_with_llm",
+            new_callable=AsyncMock,
+            side_effect=[intent_response, requirement_response],
+        ):
+            analysis = await analyze_conversation(
+                [
+                    ClientChatMessage(
+                        role="user",
+                        content="查一下广州到北京明天有哪些高铁",
+                    )
+                ]
+            )
+
+        self.assertEqual(analysis.intent, "intercity_transport_search")
+        self.assertTrue(analysis.is_complete)
+        self.assertEqual(analysis.requirements.origin, "广州")
+        self.assertEqual(analysis.requirements.destination, "北京")
+        self.assertEqual(analysis.missing_fields, [])
+
+    async def test_direct_accommodation_search_asks_only_missing_fields(self) -> None:
+        """酒店直接查询信息不完整时只追问首个必要字段。"""
+
+        intent = IntentDecision(
+            intent="accommodation_search",
+            plan_action=None,
+            reply="开始查询酒店信息",
+        )
+        with patch(
+            "app.agents.conversation_entry_agent.chat_with_llm",
+            new_callable=AsyncMock,
+            return_value=(
+                '{"intent":"accommodation_search","reply":"开始查询",'
+                '"requirements":{"destination":"北京"}}'
+            ),
+        ):
+            analysis = await analyze_search_requirements(
+                [
+                    ClientChatMessage(
+                        role="user",
+                        content="帮我查北京酒店价格",
+                    )
+                ],
+                intent=intent,
+            )
+
+        self.assertEqual(analysis.intent, "accommodation_search")
+        self.assertFalse(analysis.is_complete)
+        self.assertEqual(
+            analysis.missing_fields,
+            ["departure_date", "traveler_count", "trip_schedule"],
+        )
+        self.assertEqual(analysis.reply, "请问计划哪天入住？")
+
+    async def test_requirement_node_repairs_missing_date_from_user_message(self) -> None:
+        """模型漏返回日期时，需求节点应从用户原话补回确定性日期。"""
+
+        intent = IntentDecision(
+            intent="trip_planning",
+            plan_action="plan",
+            reply="开始分析需求",
+        )
+        requirement_response = """
+        {
+          "intent": "trip_planning",
+          "reply": "请问您计划哪天出发？",
+          "requirements": {
+            "destination": "北京",
+            "trip_duration": {
+              "raw_text": "三天",
+              "amount": 3,
+              "unit": "day",
+              "is_approximate": false
+            }
+          }
+        }
+        """
+        # 第一步：模拟模型遗漏 departure_date 和 traveler_count，但用户原话包含完整信息。
+        with patch(
+            "app.agents.conversation_entry_agent.chat_with_llm",
+            new_callable=AsyncMock,
+            return_value=requirement_response,
+        ):
+            with patch(
+                "app.agents.conversation_entry_agent.date",
+                wraps=date,
+            ) as mocked_date:
+                mocked_date.today.return_value = date(2026, 8, 15)
+                analysis = await analyze_requirements(
+                    [
+                        ClientChatMessage(
+                            role="user",
+                            content="我一个人下周六计划从广州出发到北京旅游三天",
+                        )
+                    ],
+                    intent=intent,
+                )
+
+        # 第二步：确认需求完整，不再错误追问出发日期。
+        assert analysis.requirements is not None
+        self.assertEqual(analysis.requirements.departure_date, "2026-08-22")
+        self.assertEqual(analysis.requirements.traveler_count, 1)
+        self.assertTrue(analysis.is_complete)
+        self.assertEqual(analysis.missing_fields, [])
+
+    async def test_requirement_node_repairs_airport_flight_destination(self) -> None:
+        """模型漏掉目的地时应识别“机场飞到城市”的用户表达。"""
+
+        intent = IntentDecision(
+            intent="trip_planning",
+            plan_action="plan",
+            reply="开始分析需求",
+        )
+        response = """
+        {
+          "intent": "trip_planning",
+          "reply": "请问目的地是哪里？",
+          "requirements": {
+            "trip_duration": {
+              "raw_text": "三天",
+              "amount": 3,
+              "unit": "day",
+              "is_approximate": false
+            }
+          }
+        }
+        """
+        with patch(
+            "app.agents.conversation_entry_agent.chat_with_llm",
+            new_callable=AsyncMock,
+            return_value=response,
+        ):
+            with patch(
+                "app.agents.conversation_entry_agent.date",
+                wraps=date,
+            ) as mocked_date:
+                mocked_date.today.return_value = date(2026, 8, 15)
+                analysis = await analyze_requirements(
+                    [
+                        ClientChatMessage(
+                            role="user",
+                            content=(
+                                "我下周二计划从广州白云机场飞到北京，"
+                                "旅游三天"
+                            ),
+                        )
+                    ],
+                    intent=intent,
+                )
+
+        self.assertEqual(analysis.requirements.destination, "北京")
+        self.assertEqual(analysis.requirements.origin, "广州白云机场")
+        self.assertEqual(analysis.requirements.departure_date, "2026-08-18")
+        self.assertTrue(analysis.is_complete)
+        self.assertEqual(analysis.missing_fields, [])
+
+    async def test_requirement_model_failure_falls_back_to_local_fields(self) -> None:
+        """需求模型契约失败时仍能用完整用户原话继续规划。"""
+
+        intent = IntentDecision(
+            intent="trip_planning",
+            plan_action="plan",
+            reply="开始分析需求",
+        )
+        with patch(
+            "app.agents.conversation_entry_agent.chat_with_llm",
+            new_callable=AsyncMock,
+            side_effect=ModelException.fallback_exhausted([]),
+        ):
+            analysis = await analyze_requirements(
+                [
+                    ClientChatMessage(
+                        role="user",
+                        content="我一个人下周六从广州出发到北京旅游三天",
+                    )
+                ],
+                intent=intent,
+            )
+
+        self.assertTrue(analysis.is_complete)
+        self.assertEqual(analysis.requirements.origin, "广州")
+        self.assertEqual(analysis.requirements.destination, "北京")
+        self.assertEqual(analysis.requirements.traveler_count, 1)
+        self.assertEqual(analysis.requirements.trip_duration.amount, 3)
+
+    async def test_explicit_date_change_overrides_old_requirement_snapshot(self) -> None:
+        """用户明确修改出发日期时不得继续使用旧快照日期。"""
+
+        intent = IntentDecision(
+            intent="trip_planning",
+            plan_action="modify",
+            reply="开始分析行程调整",
+        )
+        known_requirements = TripRequirements(
+            destination="北京",
+            departure_date="2026-08-21",
+            traveler_count=5,
+            trip_duration={
+                "raw_text": "3天",
+                "amount": 3,
+                "unit": "day",
+            },
+        )
+        response = (
+            '{"intent":"trip_planning","reply":"已读取修改",'
+            '"requirements":{}}'
+        )
+        with patch(
+            "app.agents.conversation_entry_agent.chat_with_llm",
+            new_callable=AsyncMock,
+            return_value=response,
+        ):
+            analysis = await analyze_requirements(
+                [
+                    ClientChatMessage(
+                        role="user",
+                        content="我要把出发时间改成2026年8月17日",
+                    )
+                ],
+                intent=intent,
+                known_requirements=known_requirements,
+            )
+
+        self.assertEqual(analysis.requirements.departure_date, "2026-08-17")
 
     async def test_relative_departure_date_is_normalized_for_weather_tools(self) -> None:
         """这周日等相对日期应在进入规划前转换为明确 ISO 日期。"""
@@ -255,6 +663,25 @@ class ConversationEntryAgentTests(unittest.IsolatedAsyncioTestCase):
                 }
                 """
             )
+
+    def test_requirement_node_ignores_invalid_plan_action_alias(self) -> None:
+        """需求节点误填意图名时不得触发重试，应由上游状态机接管动作。"""
+
+        payload = _parse_conversation_payload(
+            """
+            {
+              "intent": "trip_planning",
+              "plan_action": "trip_planning",
+              "reply": "开始规划",
+              "requirements": {
+                "destination": "北京"
+              }
+            }
+            """
+        )
+
+        self.assertIsNone(payload.plan_action)
+        self.assertEqual(payload.intent, "trip_planning")
 
     def test_rejects_chat_with_requirements(self) -> None:
         """普通聊天不得携带会被规划工作流误用的需求。"""

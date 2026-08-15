@@ -2,10 +2,10 @@
 
 import asyncio
 import logging
-from datetime import date
-from math import ceil
+from datetime import date, timedelta
 
-from app.api.exception.exceptions import AmapException, QWeatherException
+from app.api.exception.error_handler import record_error
+from app.core.trip_duration import duration_to_days
 from app.schemas import TripDuration, TripRequirements
 from app.tools.accommodation_tool import search_hotels_in_city
 from app.tools.attraction_tool import search_attractions_in_city
@@ -171,20 +171,32 @@ async def _resolve_destination_location(
     # 第二步：只接受首个候选的合法高德坐标；空结果应被视为不可用证据而非默认成功。
     geocodes = result.get("geocodes")
     if not isinstance(geocodes, list) or not geocodes:
-        unavailable_tools.append(
-            {"tool": "destination_geocode", "code": "TOOL_RESULT_EMPTY"}
+        _record_tool_failure(
+            "destination_geocode",
+            ValueError("地理编码结果为空。"),
+            unavailable_tools,
+            error_code="TOOL_RESULT_EMPTY",
+            error_message="地图工具未返回可用的地理编码结果。",
         )
         return None
     first_geocode = geocodes[0]
     if not isinstance(first_geocode, dict):
-        unavailable_tools.append(
-            {"tool": "destination_geocode", "code": "TOOL_RESULT_INVALID"}
+        _record_tool_failure(
+            "destination_geocode",
+            ValueError("地理编码首项不是对象。"),
+            unavailable_tools,
+            error_code="TOOL_RESULT_INVALID",
+            error_message="地图工具返回的地理编码结构无效。",
         )
         return None
     location = first_geocode.get("location")
     if not _is_coordinate(location):
-        unavailable_tools.append(
-            {"tool": "destination_geocode", "code": "TOOL_RESULT_INVALID"}
+        _record_tool_failure(
+            "destination_geocode",
+            ValueError("地理编码结果缺少合法坐标。"),
+            unavailable_tools,
+            error_code="TOOL_RESULT_INVALID",
+            error_message="地图工具返回的地理编码缺少合法坐标。",
         )
         return None
     logger.info("规划 Agent 工具调用完成：tool=map_route_tool.geocode result_count=1")
@@ -225,7 +237,12 @@ async def _collect_weather_evidence(
     daily_result, alerts_result = results
     evidence: dict[str, object] = {"status": "available", "forecast": []}
     if isinstance(daily_result, Exception):
-        _record_tool_failure("weather_forecast", daily_result, unavailable_tools)
+        _record_tool_failure(
+            "weather_forecast",
+            daily_result,
+            unavailable_tools,
+            error_already_logged=True,
+        )
         evidence.update(
             {
                 "status": "unavailable",
@@ -235,7 +252,11 @@ async def _collect_weather_evidence(
         )
     else:
         _log_daily_forecast_shape(daily_result)
-        forecast = _compact_daily_forecast(daily_result)
+        forecast = _filter_forecast_to_trip_window(
+            _compact_daily_forecast(daily_result),
+            requirements.departure_date,
+            requirements.trip_duration,
+        )
         evidence["forecast"] = forecast
         if not _has_usable_forecast(forecast):
             evidence.update(
@@ -251,7 +272,12 @@ async def _collect_weather_evidence(
             len(forecast),
         )
     if isinstance(alerts_result, Exception):
-        _record_tool_failure("weather_alerts", alerts_result, unavailable_tools)
+        _record_tool_failure(
+            "weather_alerts",
+            alerts_result,
+            unavailable_tools,
+            error_already_logged=True,
+        )
         evidence["current_alerts"] = []
     else:
         evidence["current_alerts"] = _compact_weather_alerts(alerts_result)
@@ -345,11 +371,23 @@ def _extract_poi_result(
         _record_tool_failure(tool_name, result, unavailable_tools)
         return []
     if not isinstance(result, dict):
-        unavailable_tools.append({"tool": tool_name, "code": "TOOL_RESULT_INVALID"})
+        _record_tool_failure(
+            tool_name,
+            ValueError("工具结果不是对象。"),
+            unavailable_tools,
+            error_code="TOOL_RESULT_INVALID",
+            error_message="地点工具返回了无法识别的结果结构。",
+        )
         return []
     pois = result.get("pois")
     if not isinstance(pois, list):
-        unavailable_tools.append({"tool": tool_name, "code": "TOOL_RESULT_INVALID"})
+        _record_tool_failure(
+            tool_name,
+            ValueError("工具结果缺少 pois 列表。"),
+            unavailable_tools,
+            error_code="TOOL_RESULT_INVALID",
+            error_message="地点工具结果缺少可用候选列表。",
+        )
         return []
 
     # 第二步：只保留名称、地址、坐标、分类和距离，过滤缺坐标项以确保可进入路线规划。
@@ -492,6 +530,41 @@ def _compact_daily_forecast(payload: dict[str, object]) -> list[dict[str, object
     return forecasts
 
 
+def _filter_forecast_to_trip_window(
+    forecast: list[dict[str, object]],
+    departure_date: str | None,
+    trip_duration: TripDuration | None,
+) -> list[dict[str, object]]:
+    """只保留实际旅行日期范围内的天气预报。"""
+
+    # 第一步：出发日期无法解析时不把供应商返回的今天预报误当成行程天气。
+    if not departure_date:
+        return []
+    try:
+        departure = date.fromisoformat(departure_date)
+    except ValueError:
+        return []
+    days_until_departure = (departure - date.today()).days
+    trip_days = duration_to_days(trip_duration)
+    if trip_days is None:
+        trip_days = max(1, MAX_FORECAST_DAYS - max(0, days_until_departure))
+    trip_end = departure + timedelta(days=trip_days)
+
+    # 第二步：按日期过滤，避免今天到出发日前的预报进入规划模型。
+    filtered_forecast: list[dict[str, object]] = []
+    for item in forecast:
+        forecast_date = item.get("date")
+        if not isinstance(forecast_date, str):
+            continue
+        try:
+            parsed_forecast_date = date.fromisoformat(forecast_date)
+        except ValueError:
+            continue
+        if departure <= parsed_forecast_date < trip_end:
+            filtered_forecast.append(item)
+    return filtered_forecast
+
+
 def _get_daily_items(payload: dict[str, object]) -> object:
     """读取供应商每日预报列表，不传递原始响应内容。"""
 
@@ -550,8 +623,10 @@ def _first_non_none(*values: object) -> object | None:
 def _compact_weather_alerts(payload: dict[str, object]) -> list[dict[str, object]]:
     """提取当前生效预警中的事件、等级和时间，避免注入完整预警正文。"""
 
-    # 第一步：当前预警为空是正常业务状态，返回空数组而不是记录工具失败。
+    # 第一步：兼容 v7 的 warning 和旧版测试桩的 alerts，当前无预警仍是正常业务状态。
     alerts = payload.get("alerts")
+    if alerts is None:
+        alerts = payload.get("warning")
     if not isinstance(alerts, list):
         return []
     compact_alerts: list[dict[str, object]] = []
@@ -704,25 +779,11 @@ def _get_forecast_days(
     days_until_departure = (departure - date.today()).days
     if not 0 <= days_until_departure < MAX_FORECAST_DAYS:
         return None
-    # 第二步：按已知时长裁剪预报天数，未知或非日级时长使用十天内剩余窗口。
-    requested_days = _duration_to_days(trip_duration)
+    # 第二步：请求从今天开始覆盖到旅行结束的窗口，供应商返回后再按行程日期过滤。
+    requested_days = duration_to_days(trip_duration)
     remaining_days = MAX_FORECAST_DAYS - days_until_departure
-    return max(1, min(requested_days or remaining_days, remaining_days))
-
-
-def _duration_to_days(trip_duration: TripDuration | None) -> int | None:
-    """将用户表达的旅行时长转换为向上取整的自然日数量。"""
-
-    # 第一步：仅在结构化时长存在时换算，避免为未知行程人为指定天数。
-    if trip_duration is None:
-        return None
-    unit_to_days = {
-        "hour": 1 / 24,
-        "day": 1,
-        "week": 7,
-        "month": 30,
-    }
-    return max(1, ceil(trip_duration.amount * unit_to_days[trip_duration.unit]))
+    forecast_window = days_until_departure + (requested_days or remaining_days)
+    return max(1, min(forecast_window, MAX_FORECAST_DAYS))
 
 
 def _select_preference(preferences: list[str], default_value: str) -> str:
@@ -740,32 +801,29 @@ def _record_tool_failure(
     tool_name: str,
     error: Exception,
     unavailable_tools: list[dict[str, str]],
+    *,
+    error_code: str = "TOOL_UNEXPECTED_ERROR",
+    error_message: str = "规划工具执行失败，已跳过当前证据。",
+    error_already_logged: bool = False,
 ) -> None:
     """将工具失败压缩为安全错误码，供方案标记待确认项。"""
 
-    # 第一步：已知业务异常只保留稳定错误码；其他异常不将异常正文、坐标或密钥传入模型上下文。
-    if isinstance(error, (AmapException, QWeatherException)):
-        code = error.code
-        provider_details = (
-            error.details if isinstance(error.details, dict) else None
+    # 第一步：统一错误码、供应商详情和异常堆栈，证据层只保留模型可消费的工具名与错误码。
+    if error_already_logged and hasattr(error, "code"):
+        unavailable_tools.append(
+            {"tool": tool_name, "code": str(getattr(error, "code"))}
         )
-    else:
-        code = "TOOL_UNEXPECTED_ERROR"
-        provider_details = None
-        logger.exception(
-            "规划 Agent 工具调用失败：tool=%s code=%s error_type=%s",
-            tool_name,
-            code,
-            type(error).__name__,
-        )
-    if isinstance(error, (AmapException, QWeatherException)):
-        logger.warning(
-            "规划 Agent 工具调用失败：tool=%s code=%s provider_details=%s",
-            tool_name,
-            code,
-            provider_details,
-        )
-    unavailable_tools.append({"tool": tool_name, "code": code})
+        return
+    info = record_error(
+        error,
+        component="tool",
+        source="planning_agent",
+        operation=tool_name,
+        context={"degraded": True},
+        default_code=error_code,
+        default_message=error_message,
+    )
+    unavailable_tools.append({"tool": tool_name, "code": str(info["code"])})
 
 
 def _is_coordinate(value: object) -> bool:
