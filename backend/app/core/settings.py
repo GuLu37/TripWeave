@@ -2,8 +2,6 @@
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
-
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -41,14 +39,17 @@ class Settings(BaseSettings):
     qweather_api_host: str | None = None
     # API Key 仅由后端通过 X-QW-Api-Key 请求头发送，禁止暴露给浏览器。
     qweather_api_key: str | None = None
-    # 浏览器查询由 MCP Tool 执行，本地不直接抓取网站。
-    browser_search_provider: Literal["mcp"] = "mcp"
-    browser_search_timeout_seconds: float = Field(default=90, gt=0, le=300)
-    mcp_server_url: str | None = None
-    mcp_auth_token: str | None = None
-    mcp_protocol_version: str = Field(default="2025-06-18", min_length=1)
-    mcp_max_steps: int = Field(default=12, ge=1, le=30)
-    mcp_max_observation_chars: int = Field(default=12_000, ge=1_000, le=50_000)
+    # Unsplash Access Key 仅由后端调用图片搜索接口，前端只接收图片和署名信息。
+    unsplash_access_key: str | None = None
+    unsplash_base_url: str = Field(
+        default="https://api.unsplash.com",
+        min_length=1,
+    )
+    # LangGraph 会话检查点默认保存到 backend/data，便于本地重启后恢复会话。
+    langgraph_checkpoint_path: str = Field(
+        default="data/tripweave_checkpoints.sqlite",
+        min_length=1,
+    )
     cors_allow_origins: str = Field(min_length=1)
     log_max_bytes: int = Field(default=1_048_576, ge=1)
     log_backup_count: int = Field(default=5, ge=1)
@@ -80,6 +81,17 @@ class Settings(BaseSettings):
             for provider in self.llm_fallback_providers.split(",")
             if provider.strip()
         ]
+
+    @property
+    def langgraph_checkpoint_file(self) -> Path:
+        """返回解析后的 LangGraph SQLite 检查点文件路径。"""
+
+        # 第一步：相对路径固定相对于 backend 目录，避免启动目录变化导致状态文件漂移。
+        checkpoint_path = Path(self.langgraph_checkpoint_path).expanduser()
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = ENV_FILE_PATH.parent / checkpoint_path
+        # 第二步：只返回规范化路径，目录创建交给检查点初始化阶段处理。
+        return checkpoint_path.resolve()
 
 
 @lru_cache

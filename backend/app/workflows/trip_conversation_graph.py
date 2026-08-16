@@ -1,10 +1,19 @@
 """统一入口、旅差规划与审核总结 Agent 的 LangGraph 编排图。"""
 
+import asyncio
 import logging
+import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
+from pathlib import Path
 from typing import TypedDict
+from uuid import uuid4
 
+import aiosqlite
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.conversation_entry_agent import (
@@ -17,6 +26,8 @@ from app.agents.planning_agent import plan_trip
 from app.agents.review_agent import review_trip
 from app.agents.accommodation_search_agent import search_accommodation
 from app.agents.intercity_transport_search_agent import search_intercity_transport
+from app.core.settings import get_settings
+from app.services.confirmed_trip_service import build_confirmed_trip_details
 from app.schemas import (
     ClientChatMessage,
     ConfirmedTripPlan,
@@ -29,6 +40,7 @@ from app.schemas import (
 
 logger = logging.getLogger(__name__)
 MAX_REPLAN_ATTEMPTS = 2
+CHECKPOINT_MESSAGE_LIMIT = 120
 HOTEL_OFFER_LABELS = (
     ("name", "酒店"),
     ("room_type", "房型"),
@@ -47,12 +59,30 @@ TRANSPORT_OFFER_LABELS = (
     ("availability", "余票"),
 )
 
+_checkpoint_context = None
+_checkpointer: AsyncSqliteSaver | None = None
+_graph_initialization_lock = asyncio.Lock()
+_CHECKPOINT_ALLOWED_MSGPACK_MODULES = [
+    ("app.schemas", "ClientChatMessage"),
+    ("app.schemas", "ConfirmedTripDetails"),
+    ("app.schemas", "ConfirmedTripPlan"),
+    ("app.schemas", "ConversationAnalysis"),
+    ("app.schemas", "ReviewResult"),
+    ("app.schemas", "TripImage"),
+    ("app.schemas", "TripRoute"),
+    ("app.schemas", "TripRouteOption"),
+    ("app.schemas", "TripDuration"),
+    ("app.schemas", "TripPlanSnapshot"),
+    ("app.schemas", "TripRequirements"),
+    ("app.schemas", "ValidationIssue"),
+    ("app.agents.conversation_entry_agent", "IntentDecision"),
+]
+
 
 class TripConversationState(TypedDict, total=False):
     """入口、规划和审核节点在图中传递的内部状态。"""
 
     messages: list[ClientChatMessage]
-    memory_summary: str | None
     known_requirements: TripRequirements | None
     pending_plan: TripPlanSnapshot | None
     intent_decision: IntentDecision
@@ -69,33 +99,199 @@ class TripConversationState(TypedDict, total=False):
 async def run_trip_conversation(
     messages: list[ClientChatMessage],
     *,
-    memory_summary: str | None = None,
+    conversation_id: str | None = None,
     known_requirements: TripRequirements | None = None,
     pending_plan: TripPlanSnapshot | None = None,
 ) -> ConversationAnalysis:
     """运行入口、规划和审核节点，并返回统一对话分析结果。"""
 
-    # 第一步：将浏览器会话和需求快照作为图初始状态，保持原聊天接口契约不变。
-    result = await get_trip_conversation_graph().ainvoke(
-        {
-            "messages": messages,
-            "memory_summary": memory_summary,
-            "known_requirements": known_requirements,
-            "pending_plan": pending_plan,
-            "replan_attempts": 0,
-        }
+    # 第一步：确保 SQLite Checkpointer 已打开；测试或非 FastAPI 调用也能按需初始化。
+    await _ensure_trip_conversation_graph()
+    thread_id = conversation_id or str(uuid4())
+    graph = get_trip_conversation_graph()
+    config = {"configurable": {"thread_id": thread_id}}
+    checkpoint = await graph.aget_state(config)
+    stored_messages = checkpoint.values.get("messages", [])
+    merged_messages = _merge_messages(stored_messages, messages)
+    stored_pending_plan = _get_pending_plan(checkpoint.values)
+    input_state: dict[str, object] = {
+        "messages": merged_messages,
+    }
+    # 第二步：只覆盖本轮明确提供的可选状态，避免空值清除 Checkpointer 中的待确认方案。
+    if known_requirements is not None:
+        input_state["known_requirements"] = known_requirements
+    if pending_plan is not None:
+        input_state["pending_plan"] = pending_plan
+    # 第三步：通过 thread_id 恢复同一会话的历史状态，并执行本轮用户消息。
+    logger.info(
+        "LangGraph 会话执行：thread_id=%s incoming_message_count=%s "
+        "stored_message_count=%s merged_message_count=%s has_pending_snapshot=%s",
+        thread_id,
+        len(messages),
+        len(stored_messages) if isinstance(stored_messages, list) else 0,
+        len(merged_messages),
+        pending_plan is not None or stored_pending_plan is not None,
+    )
+    result = await graph.ainvoke(
+        input_state,
+        config=config,
     )
     analysis = result.get("analysis")
-    # 第二步：图的两个终点都必须由入口节点产出结构化分析，缺失时说明图实现出现了内部错误。
+    # 第四步：图的两个终点都必须由入口节点产出结构化分析，缺失时说明图实现出现了内部错误。
     if not isinstance(analysis, ConversationAnalysis):
         raise RuntimeError("旅差对话图未返回 ConversationAnalysis。")
+    # 第五步：将助手回复写回服务端历史；下一轮即使只提交当前用户消息也能恢复上下文。
+    persisted_messages = result.get("messages", merged_messages)
+    if not isinstance(persisted_messages, list):
+        persisted_messages = merged_messages
+    await graph.aupdate_state(
+        config,
+        {
+            "messages": _limit_messages(
+                [
+                    *persisted_messages,
+                    ClientChatMessage(role="assistant", content=analysis.reply),
+                ]
+            )
+        },
+    )
     return analysis
+
+
+def _merge_messages(
+    stored_messages: object,
+    incoming_messages: list[ClientChatMessage],
+) -> list[ClientChatMessage]:
+    """合并检查点历史和客户端窗口，避免重复并限制服务端历史长度。"""
+
+    # 第一步：只接受检查点中已反序列化的客户端消息，异常状态不阻断当前请求。
+    previous = (
+        [
+            message
+            for message in stored_messages
+            if isinstance(message, ClientChatMessage)
+        ]
+        if isinstance(stored_messages, list)
+        else []
+    )
+    incoming = [
+        message
+        for message in incoming_messages
+        if isinstance(message, ClientChatMessage)
+    ]
+    if not previous:
+        return _limit_messages(incoming)
+    if not incoming:
+        return _limit_messages(previous)
+
+    # 第二步：寻找历史后缀与客户端窗口前缀的最长重叠，兼容前端回传最近八条和只传当前消息两种模式。
+    overlap = 0
+    max_overlap = min(len(previous), len(incoming))
+    for size in range(max_overlap, 0, -1):
+        if all(
+            _messages_equal(left, right)
+            for left, right in zip(previous[-size:], incoming[:size])
+        ):
+            overlap = size
+            break
+    return _limit_messages([*previous, *incoming[overlap:]])
+
+
+def _messages_equal(
+    left: ClientChatMessage,
+    right: ClientChatMessage,
+) -> bool:
+    """兼容前端对超长助手回复的截短副本。"""
+
+    if left.role != right.role:
+        return False
+    if left.content == right.content:
+        return True
+    if left.role != "assistant":
+        return False
+    return (
+        left.content.startswith(right.content)
+        or right.content.startswith(left.content)
+    )
+
+
+def _limit_messages(messages: list[ClientChatMessage]) -> list[ClientChatMessage]:
+    """限制检查点保存的消息数量，保留足够历史供 Agent 二次检索。"""
+
+    return messages[-CHECKPOINT_MESSAGE_LIMIT:]
+
+
+async def initialize_trip_conversation_graph() -> None:
+    """初始化 LangGraph SQLite Checkpointer 与编译后的工作流。"""
+
+    await _ensure_trip_conversation_graph()
+
+
+async def close_trip_conversation_graph() -> None:
+    """关闭 LangGraph SQLite Checkpointer，释放服务退出时的连接。"""
+
+    global _checkpoint_context, _checkpointer
+    async with _graph_initialization_lock:
+        # 第一步：先清理编译图缓存，避免后续误用已经关闭的检查点连接。
+        get_trip_conversation_graph.cache_clear()
+        if _checkpoint_context is not None:
+            await _checkpoint_context.__aexit__(None, None, None)
+        _checkpoint_context = None
+        _checkpointer = None
+
+
+async def _ensure_trip_conversation_graph() -> None:
+    """按需打开持久化检查点并编译共享工作流。"""
+
+    global _checkpoint_context, _checkpointer
+    if _checkpointer is not None:
+        return
+    async with _graph_initialization_lock:
+        if _checkpointer is not None:
+            return
+        checkpoint_file = get_settings().langgraph_checkpoint_file
+        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+        context = _open_checkpoint_context(checkpoint_file)
+        try:
+            # 第一步：打开 SQLite 连接并创建 Checkpointer 所需的数据表。
+            saver = await context.__aenter__()
+            await saver.setup()
+        except Exception:
+            await context.__aexit__(*sys.exc_info())
+            raise
+        _checkpoint_context = context
+        _checkpointer = saver
+        # 第二步：将新打开的持久化 Checkpointer 注入编译图。
+        get_trip_conversation_graph.cache_clear()
+        logger.info(
+            "LangGraph Checkpointer 已初始化：backend=sqlite path=%s",
+            checkpoint_file,
+        )
+
+
+@asynccontextmanager
+async def _open_checkpoint_context(
+    checkpoint_file: Path,
+) -> AsyncIterator[AsyncSqliteSaver]:
+    """打开带类型白名单的 SQLite Checkpointer 连接。"""
+
+    # 第一步：使用独立异步连接，避免同步 SQLite I/O 阻塞 FastAPI 事件循环。
+    async with aiosqlite.connect(str(checkpoint_file)) as connection:
+        # 第二步：只允许当前项目定义的结构化类型反序列化，避免开启全量模块加载。
+        yield AsyncSqliteSaver(
+            connection,
+            serde=JsonPlusSerializer(
+                allowed_msgpack_modules=_CHECKPOINT_ALLOWED_MSGPACK_MODULES,
+            ),
+        )
 
 
 @lru_cache
 def get_trip_conversation_graph():
     """构建并缓存入口、规划和审核总结的已编译 LangGraph。"""
 
+    if _checkpointer is None:
+        raise RuntimeError("LangGraph Checkpointer 尚未初始化。")
     # 第一步：将意图判断与需求分析拆成两个轻量节点，图层只负责顺序和路由。
     graph = StateGraph(TripConversationState)
     graph.add_node("intent_detection", _intent_detection_node)
@@ -174,8 +370,8 @@ def get_trip_conversation_graph():
     graph.add_edge("confirm_trip", END)
     graph.add_edge("clarify_intent", END)
     graph.add_edge("blocked_confirmation", END)
-    # 第四步：编译后的图可在每个请求中安全复用，避免重复建立静态节点和边。
-    return graph.compile()
+    # 第四步：使用持久化 Checkpointer 编译图，使同一 thread_id 可跨请求恢复状态。
+    return graph.compile(checkpointer=_checkpointer)
 
 
 async def _intent_detection_node(
@@ -183,14 +379,13 @@ async def _intent_detection_node(
 ) -> dict[str, object]:
     """调用意图 Agent，只判断当前消息属于聊天还是旅差流程。"""
 
-    pending_plan = state.get("pending_plan")
+    pending_plan = _get_pending_plan(state)
     known_requirements = _get_effective_requirements(state)
     # 第一步：意图节点不提取需求字段，确保旅差流程必然经过需求分析节点。
     intent_decision = await analyze_intent(
         state["messages"],
         known_requirements=known_requirements,
         pending_plan=pending_plan,
-        memory_summary=state.get("memory_summary"),
     )
     if intent_decision.intent == "chat":
         return {
@@ -222,7 +417,7 @@ async def _requirement_analysis_node(
     """在旅差意图确定后分析需求，并把结果交给条件路由。"""
 
     intent_decision = state["intent_decision"]
-    pending_plan = state.get("pending_plan")
+    pending_plan = _get_pending_plan(state)
     known_requirements = _get_effective_requirements(state)
     # 第一步：需求节点负责合并快照、归一化日期和计算真实缺失字段。
     analysis = await analyze_requirements(
@@ -230,7 +425,6 @@ async def _requirement_analysis_node(
         intent=intent_decision,
         known_requirements=known_requirements,
         pending_plan=pending_plan,
-        memory_summary=state.get("memory_summary"),
     )
     if pending_plan is not None and analysis.pending_plan is None:
         # 第二步：追问或修改条件未完成时继续保留旧方案，避免前端覆盖待确认状态。
@@ -247,8 +441,7 @@ async def _search_requirement_analysis_node(
         state["messages"],
         intent=state["intent_decision"],
         known_requirements=_get_effective_requirements(state),
-        pending_plan=state.get("pending_plan"),
-        memory_summary=state.get("memory_summary"),
+        pending_plan=_get_pending_plan(state),
     )
     return {"analysis": analysis}
 
@@ -260,7 +453,7 @@ def _route_after_conversation_entry(
 
     # 第一步：旧调用方传入完整 analysis 时复用新的需求分析路由规则。
     analysis = state["analysis"]
-    pending_plan = state.get("pending_plan")
+    pending_plan = _get_pending_plan(state)
     if analysis.plan_action == "confirm" and pending_plan is not None:
         return (
             "confirm_trip"
@@ -300,9 +493,9 @@ def _route_after_intent_detection(state: TripConversationState) -> str:
         return "search_requirement_analysis"
     if (
         intent_decision.plan_action == "confirm"
-        and state.get("pending_plan") is not None
+        and _get_pending_plan(state) is not None
     ):
-        pending_plan = state["pending_plan"]
+        pending_plan = _get_pending_plan(state)
         return (
             "confirm_trip"
             if pending_plan.review_result.status == "ready_for_confirmation"
@@ -338,13 +531,34 @@ def _route_after_search_requirement_analysis(
 def _get_effective_requirements(
     state: TripConversationState,
 ) -> TripRequirements | None:
-    """按待确认方案优先、已确认快照其次的顺序读取需求。"""
+    """按待确认方案、外部快照和图内分析结果的顺序读取需求。"""
 
     # 第一步：待确认方案代表最新一次规划结果，不能被前端携带的旧快照覆盖。
-    pending_plan = state.get("pending_plan")
+    pending_plan = _get_pending_plan(state)
     if pending_plan is not None:
         return pending_plan.requirements
-    return state.get("known_requirements")
+    known_requirements = state.get("known_requirements")
+    if known_requirements is not None:
+        return known_requirements
+    # 第二步：同一 thread_id 恢复出的历史分析也是有效需求快照，支持用户只回复“一个人”等短句。
+    analysis = state.get("analysis")
+    if isinstance(analysis, ConversationAnalysis):
+        return analysis.requirements
+    return None
+
+
+def _get_pending_plan(state: object) -> TripPlanSnapshot | None:
+    """读取顶层待确认快照，并兼容旧检查点中的嵌套快照。"""
+
+    if not isinstance(state, dict):
+        return None
+    pending_plan = state.get("pending_plan")
+    if isinstance(pending_plan, TripPlanSnapshot):
+        return pending_plan
+    analysis = state.get("analysis")
+    if isinstance(analysis, ConversationAnalysis):
+        return analysis.pending_plan
+    return None
 
 
 def _get_latest_user_message(
@@ -370,7 +584,7 @@ async def _trip_planning_node(
         raise RuntimeError("完整旅差分支缺少 TripRequirements。")
     replan_context = state.get("replan_context")
     if replan_context is None and analysis.plan_action == "modify":
-        pending_plan = state.get("pending_plan")
+        pending_plan = _get_pending_plan(state)
         if pending_plan is not None:
             latest_user_message = _get_latest_user_message(state["messages"])
             if latest_user_message is None:
@@ -441,7 +655,10 @@ async def _direct_accommodation_search_node(
     return {
         "accommodation_search": result,
         "analysis": analysis.model_copy(
-            update={"reply": _format_direct_search_result("酒店查询结果", result)}
+            update={
+                "reply": _format_direct_search_result("酒店查询结果", result),
+                "search_results": {"accommodation": result},
+            }
         ),
     }
 
@@ -449,7 +666,7 @@ async def _direct_accommodation_search_node(
 async def _direct_intercity_transport_search_node(
     state: TripConversationState,
 ) -> dict[str, object]:
-    """完成用户直接发起的铁路查询并返回口语化结果。"""
+    """完成用户直接发起的飞机与火车查询并返回口语化结果。"""
 
     analysis = state["analysis"]
     requirements = analysis.requirements
@@ -461,9 +678,10 @@ async def _direct_intercity_transport_search_node(
         "analysis": analysis.model_copy(
             update={
                 "reply": _format_direct_search_result(
-                    "铁路班次查询结果",
+                    "飞机/火车查询结果",
                     result,
-                )
+                ),
+                "search_results": {"intercity_transport": result},
             }
         ),
     }
@@ -544,7 +762,7 @@ def _review_feedback_node(
 
 def _await_confirmation_node(
     state: TripConversationState,
-) -> dict[str, ConversationAnalysis]:
+) -> dict[str, object]:
     """生成待用户确认的完整方案，并将快照回传给前端。"""
 
     analysis = state["analysis"]
@@ -558,10 +776,12 @@ def _await_confirmation_node(
         status_text="该方案已完成规划、规则校验和审核总结，等待您确认。",
     )
     return {
+        "pending_plan": pending_plan,
         "analysis": analysis.model_copy(
             update={
                 "reply": reply,
                 "pending_plan": pending_plan,
+                "search_results": _get_external_search_evidence(state),
             }
         )
     }
@@ -569,7 +789,7 @@ def _await_confirmation_node(
 
 def _user_decision_node(
     state: TripConversationState,
-) -> dict[str, ConversationAnalysis]:
+) -> dict[str, object]:
     """在不可自动修复或达到次数上限时返回缺陷与可继续修改的方案快照。"""
 
     analysis = state["analysis"]
@@ -583,35 +803,42 @@ def _user_decision_node(
         status_text="该方案暂不能自动通过审核，请补充修改要求后重新规划。",
     )
     return {
+        "pending_plan": pending_plan,
         "analysis": analysis.model_copy(
             update={
                 "reply": reply,
                 "pending_plan": pending_plan,
+                "search_results": _get_external_search_evidence(state),
             }
         )
     }
 
 
-def _confirm_trip_node(
+async def _confirm_trip_node(
     state: TripConversationState,
-) -> dict[str, ConversationAnalysis]:
-    """确认待确认方案并清除前端需要回传的方案快照。"""
+) -> dict[str, object]:
+    """确认方案并补充图片、路线等前端展示数据。"""
 
     analysis = state["analysis"]
-    pending_plan = state.get("pending_plan")
+    pending_plan = _get_pending_plan(state)
     if pending_plan is None:
         raise RuntimeError("确认分支缺少待确认方案。")
+    confirmed_details = await build_confirmed_trip_details(
+        pending_plan.requirements,
+    )
     confirmed_plan = ConfirmedTripPlan(
         requirements=pending_plan.requirements,
         proposal=pending_plan.proposal,
         review_result=pending_plan.review_result,
         confirmed_at=datetime.now(timezone.utc),
+        details=confirmed_details,
     )
-    # 第一步：返回确认结果并清除待确认快照，后续可直接将 confirmed_plan 写入数据库。
+    # 第一步：保留完整草案，并将图片与路线取证结果一并返回给前端。
     return {
+        "pending_plan": None,
         "analysis": analysis.model_copy(
             update={
-                "reply": "已确认当前行程方案。",
+                "reply": "已确认当前行程方案，完整方案、图片和路线信息已生成。",
                 "pending_plan": None,
                 "confirmed_plan": confirmed_plan,
             }
@@ -625,7 +852,7 @@ def _clarify_intent_node(
     """为无法稳定判断的消息生成澄清回复。"""
 
     # 第一步：不确定意图只结束当前轮，不让需求分析节点凭关键词追问旅行字段。
-    pending_plan = state.get("pending_plan")
+    pending_plan = _get_pending_plan(state)
     return {
         "analysis": ConversationAnalysis(
             intent="chat",
@@ -641,7 +868,7 @@ def _blocked_confirmation_node(
     """处理尚未满足确认条件的确认请求。"""
 
     analysis = state["analysis"]
-    pending_plan = state.get("pending_plan")
+    pending_plan = _get_pending_plan(state)
     if pending_plan is None:
         raise RuntimeError("确认阻断分支缺少待确认方案。")
     if pending_plan.review_result.status == "needs_replanning":
@@ -790,11 +1017,11 @@ def _get_external_search_evidence(
 
 
 def _has_configured_search_result(evidence: dict[str, object]) -> bool:
-    """判断查询结果是否来自已配置来源，而不是默认未配置状态。"""
+    """判断是否至少有一个酒店或交通估算结果。"""
 
     return any(
         isinstance(result, dict)
-        and result.get("status") == "available"
+        and result.get("status") in {"available", "estimated"}
         for result in evidence.values()
     )
 
@@ -812,7 +1039,7 @@ def _format_direct_search_result(
     section = _format_available_search_result(
         title,
         result,
-        TRANSPORT_OFFER_LABELS if "铁路" in title else HOTEL_OFFER_LABELS,
+        HOTEL_OFFER_LABELS if "酒店" in title else TRANSPORT_OFFER_LABELS,
     )
     return section or "当前查询暂时没有可用结果。"
 
@@ -855,9 +1082,9 @@ def _format_available_search_result(
     result: dict[str, object],
     labels: tuple[tuple[str, str], ...],
 ) -> str | None:
-    """格式化可用查询结果；状态或字段无效时返回 None。"""
+    """格式化可用或估算查询结果；状态或字段无效时返回 None。"""
 
-    if result.get("status") != "available":
+    if result.get("status") not in {"available", "estimated"}:
         return None
     offers = result.get("offers")
     if not isinstance(offers, list):
@@ -876,7 +1103,13 @@ def _format_available_search_result(
             lines.append("- " + "；".join(fields))
     if len(lines) == 1:
         return None
-    lines.append("以上为查询时快照，价格、库存和余票需在下单前再次核验。")
+    message = result.get("message")
+    if isinstance(message, str) and message.strip():
+        lines.append(message)
+    elif result.get("status") == "estimated":
+        lines.append("后端尚未接入对应实时 API，以上仅提供价格参考，不代表实时价格、库存或余票。")
+    else:
+        lines.append("以上为查询时快照，价格、库存和余票需在下单前再次核验。")
     return "\n".join(lines)
 
 

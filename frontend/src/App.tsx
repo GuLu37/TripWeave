@@ -64,11 +64,44 @@ type TripPlanSnapshot = {
   review_result: ReviewResult;
 };
 
+type TripImage = {
+  category: "attraction" | "food";
+  query: string;
+  url: string;
+  thumb_url: string | null;
+  alt_text: string | null;
+  photographer: string | null;
+  source_url: string | null;
+};
+
+type TripRouteOption = {
+  mode: "transit" | "walking" | "driving" | "bicycling";
+  mode_label: string;
+  distance_text: string | null;
+  duration_text: string | null;
+};
+
+type TripRoute = {
+  category: "attraction" | "food";
+  origin: string;
+  destination: string;
+  options: TripRouteOption[];
+  unavailable_modes: string[];
+};
+
+type ConfirmedTripDetails = {
+  images: TripImage[];
+  routes: TripRoute[];
+  tool_status: Record<string, "available" | "unavailable" | "skipped">;
+};
+
 type ConfirmedTripPlan = TripPlanSnapshot & {
   confirmed_at: string;
+  details: ConfirmedTripDetails;
 };
 
 type ChatApiResponse = {
+  conversation_id: string;
   analysis: ConversationAnalysis;
   short_term_memory: ShortTermMemory;
 };
@@ -137,6 +170,105 @@ function buildQuickRequirementMessage(form: QuickForm): string {
   return parts.length ? `补充行程需求：${parts.join("，")}。` : "";
 }
 
+function ConfirmedPlanView({ plan }: { plan: ConfirmedTripPlan }) {
+  const attractionImages = plan.details.images.filter(
+    (image) => image.category === "attraction",
+  );
+  const foodImages = plan.details.images.filter((image) => image.category === "food");
+  const hasUnavailableTool = Object.values(plan.details.tool_status).some(
+    (status) => status !== "available",
+  );
+
+  return (
+    <section className="confirmed-plan" aria-label="已确认行程方案">
+      <div className="confirmed-plan-header">
+        <div>
+          <span className="plan-kicker">已确认方案</span>
+          <h2>完整旅差安排</h2>
+        </div>
+        <span className="plan-confirmed">已确认</span>
+      </div>
+
+      <section className="plan-section">
+        <h3>行程方案</h3>
+        <pre className="plan-proposal">{plan.proposal}</pre>
+      </section>
+
+      {(attractionImages.length > 0 || foodImages.length > 0) && (
+        <section className="plan-section">
+          <div className="plan-section-heading">
+            <h3>目的地灵感</h3>
+            <span>图片来自 Unsplash</span>
+          </div>
+          <div className="plan-image-grid">
+            {[...attractionImages, ...foodImages].map((image) => (
+              <figure className="plan-image-card" key={`${image.category}-${image.url}`}>
+                <img
+                  src={image.url}
+                  alt={image.alt_text ?? image.query}
+                  loading="lazy"
+                />
+                <figcaption>
+                  <strong>{image.category === "food" ? "美食" : "景点"}</strong>
+                  <span>{image.alt_text ?? image.query}</span>
+                  {image.photographer && <small>摄影：{image.photographer}</small>}
+                  {image.source_url && (
+                    <a
+                      href={image.source_url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      查看 Unsplash 来源
+                    </a>
+                  )}
+                </figcaption>
+              </figure>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {plan.details.routes.length > 0 && (
+        <section className="plan-section">
+          <div className="plan-section-heading">
+            <h3>高德路线参考</h3>
+            <span>城市内路线，不含购票或打车订单</span>
+          </div>
+          <div className="plan-route-list">
+            {plan.details.routes.map((route) => (
+              <article
+                className="plan-route"
+                key={`${route.category}-${route.destination}`}
+              >
+                <div className="route-title">
+                  <strong>{route.origin}</strong>
+                  <span aria-hidden="true">→</span>
+                  <strong>{route.destination}</strong>
+                </div>
+                <div className="route-options">
+                  {route.options.map((option) => (
+                    <span className="route-option" key={option.mode}>
+                      <b>{option.mode_label}</b>
+                      <span>{option.distance_text ?? "距离未知"}</span>
+                      <span>{option.duration_text ?? "耗时未知"}</span>
+                    </span>
+                  ))}
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {hasUnavailableTool && (
+          <p className="plan-degraded">
+            部分图片或路线服务当前不可用，完整文字方案仍可正常使用。
+          </p>
+      )}
+    </section>
+  );
+}
+
 /** 渲染并管理浏览器内存中的多轮对话。 */
 function App() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -145,12 +277,17 @@ function App() {
   const [error, setError] = useState("");
   const [analysis, setAnalysis] = useState<ConversationAnalysis | null>(null);
   const [tripContext, setTripContext] = useState<ConversationAnalysis | null>(null);
+  const [confirmedPlan, setConfirmedPlan] = useState<ConfirmedTripPlan | null>(null);
   const [shortTermMemory, setShortTermMemory] = useState<ShortTermMemory | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(() =>
+    localStorage.getItem("tripweave_conversation_id"),
+  );
   const [isQuickFormOpen, setIsQuickFormOpen] = useState(false);
   const [quickForm, setQuickForm] = useState<QuickForm>(createEmptyQuickForm);
+  const confirmedPlanRef = useRef<HTMLDivElement | null>(null);
   const nextMessageId = useRef(0);
   const failedMessage = messages.find((message) => message.delivery === "failed");
-  const canUseQuickForm = analysis?.intent === "trip_planning";
+  const canUseQuickForm = analysis?.intent === "trip_planning" && !confirmedPlan;
   const missingFields = new Set(analysis?.missing_fields ?? []);
 
   useEffect(() => {
@@ -176,6 +313,16 @@ function App() {
     if (!analysis.is_complete) setIsQuickFormOpen(true);
   }, [analysis]);
 
+  useEffect(() => {
+    if (!confirmedPlan) return;
+    requestAnimationFrame(() => {
+      confirmedPlanRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    });
+  }, [confirmedPlan]);
+
   /** 将指定的本地消息历史提交后端，并同步处理成功或失败状态。 */
   async function requestAssistantReply(
     nextMessages: Message[],
@@ -192,14 +339,12 @@ function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          // 第一步：只发送当前消息，近期窗口和历史摘要由后端短期记忆统一管理。
+          // 第一步：只发送当前消息，近期窗口由后端统一裁剪。
           messages: [{ role: pendingMessage.role, content: pendingMessage.content }],
-          // 第二步：回传上一轮短期记忆，后端合并后自动更新窗口和摘要。
+          // 第二步：回传会话 ID，让 LangGraph 从服务端 Checkpointer 恢复完整状态。
+          conversation_id: conversationId ?? undefined,
+          // 第三步：回传最近消息窗口，兼容现有接口契约。
           short_term_memory: shortTermMemory ?? undefined,
-          // 第三步：旅差场景补充上轮确认的结构化需求，保证记忆截短后仍保留关键条件。
-          known_requirements: tripContext?.requirements ?? undefined,
-          // 第四步：普通聊天不会清除最近一次旅差上下文，后续修改仍能恢复结构化需求。
-          pending_plan: tripContext?.pending_plan ?? undefined,
         }),
       });
       const data = await response.json().catch(() => null) as ChatApiResponse | ChatApiError | null;
@@ -212,6 +357,8 @@ function App() {
         !data
         || !("analysis" in data)
         || !data.analysis
+        || !("conversation_id" in data)
+        || !data.conversation_id
         || !("short_term_memory" in data)
         || !data.short_term_memory
       ) {
@@ -230,10 +377,15 @@ function App() {
           content: data.analysis.reply,
         },
       ]);
-      // 第一步：保存后端已校验的分析结果和短期记忆快照。
+      // 第一步：保存后端已校验的分析结果和本地上下文窗口。
+      setConversationId(data.conversation_id);
+      localStorage.setItem("tripweave_conversation_id", data.conversation_id);
       setAnalysis(data.analysis);
       if (data.analysis.intent === "trip_planning") {
         setTripContext(data.analysis);
+      }
+      if (data.analysis.confirmed_plan) {
+        setConfirmedPlan(data.analysis.confirmed_plan);
       }
       setShortTermMemory(data.short_term_memory);
     } catch (requestError) {
@@ -346,6 +498,11 @@ function App() {
               <span className="message-label">TripWeave</span>
               <p>正在思考…</p>
             </article>
+          )}
+          {confirmedPlan && (
+            <div ref={confirmedPlanRef}>
+              <ConfirmedPlanView plan={confirmedPlan} />
+            </div>
           )}
         </div>
 
@@ -560,7 +717,7 @@ function App() {
             disabled={isSending || Boolean(failedMessage)}
           />
           <div className="composer-footer">
-            <span>对话内容仅保留在当前浏览器页面</span>
+            <span>当前会话状态已保存，可继续恢复对话</span>
             <button
               type="submit"
               disabled={!draft.trim() || isSending || Boolean(failedMessage)}

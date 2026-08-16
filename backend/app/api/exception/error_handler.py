@@ -49,7 +49,10 @@ def record_error(
         info["message"],
         info["details"],
         context or {},
-        exc_info=not isinstance(error, AppException),
+        exc_info=not isinstance(
+            error,
+            (AppException, httpx.HTTPError, ValidationError),
+        ),
     )
     return info
 
@@ -79,13 +82,17 @@ def describe_error(
         }
 
     if isinstance(error, httpx.HTTPStatusError):
+        details: dict[str, object] = {
+            "upstream_status_code": error.response.status_code,
+        }
+        response_text = error.response.text.strip()
+        if response_text:
+            details["upstream_message"] = _safe_error_text(response_text)
         return {
             "code": default_code,
             "message": default_message,
             "error_type": type(error).__name__,
-            "details": {
-                "upstream_status_code": error.response.status_code,
-            },
+            "details": details,
         }
 
     if isinstance(error, httpx.HTTPError):
@@ -93,7 +100,9 @@ def describe_error(
             "code": default_code,
             "message": default_message,
             "error_type": type(error).__name__,
-            "details": None,
+            "details": {
+                "exception_message": _safe_error_text(str(error)),
+            },
         }
 
     return {

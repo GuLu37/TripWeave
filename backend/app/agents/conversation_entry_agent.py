@@ -1,6 +1,7 @@
 """TripWeave 的统一对话入口 Agent。"""
 
 import json
+import logging
 import re
 from datetime import date, timedelta
 from typing import Literal
@@ -12,13 +13,14 @@ from app.api.exception.error_handler import record_error
 from app.api.exception.exceptions import AppException
 from app.integrations.llm.client import chat_with_llm
 from app.integrations.llm.response_cleaner import extract_json_response
-from app.memory.short_term_memory import build_memory_prompt_context
 from app.schemas import (
     ClientChatMessage,
     ConversationAnalysis,
     TripPlanSnapshot,
     TripRequirements,
 )
+
+logger = logging.getLogger(__name__)
 
 # MVP 阶段将目的地、出行时间和人数作为进入行程规划的最低信息门槛。
 CORE_REQUIREMENT_FIELDS = (
@@ -56,8 +58,10 @@ _CHINESE_FULL_DATE_PATTERN = re.compile(
 _CHINESE_MONTH_DAY_PATTERN = re.compile(
     r"^(?P<month>\d{1,2})月(?P<day>\d{1,2})日?$"
 )
-# 保留近期对话即可覆盖当前追问，历史需求由 known_requirements 快照补充。
-CONTEXT_MESSAGE_LIMIT = 8
+# 最近窗口用于理解当前追问，窗口之外的少量历史用于找回用户早先的表达。
+RECENT_CONTEXT_MESSAGE_LIMIT = 8
+HISTORICAL_CONTEXT_MESSAGE_LIMIT = 6
+HISTORICAL_MESSAGE_MAX_CHARS = 1_200
 STRUCTURED_OUTPUT_TEMPERATURE = 0.1
 STRUCTURED_OUTPUT_MAX_TOKENS = 1024
 INTERACTIVE_MAX_ATTEMPTS = 2
@@ -96,19 +100,30 @@ async def analyze_intent(
     *,
     known_requirements: TripRequirements | None = None,
     pending_plan: TripPlanSnapshot | None = None,
-    memory_summary: str | None = None,
 ) -> IntentDecision:
     """只判断当前消息意图，不提取旅差字段。"""
 
-    # 第一步：意图节点只读取近期消息和状态快照，避免提前承担需求完整性判断。
-    context_messages = messages[-CONTEXT_MESSAGE_LIMIT:]
+    # 第一步：意图节点读取近期消息和窗口外的少量历史，结构化快照继续作为稳定记忆。
+    context_messages = _build_agent_context(messages)
+    latest_user_text = _get_latest_user_text(messages)
+    rule_decision = _resolve_intent_with_rules(
+        messages,
+        known_requirements=known_requirements,
+        pending_plan=pending_plan,
+    )
+    if _can_resolve_intent_locally(latest_user_text, rule_decision):
+        logger.info(
+            "意图判断使用本地规则：intent=%s context_message_count=%s",
+            rule_decision.intent,
+            len(context_messages),
+        )
+        return rule_decision
     try:
         response_text = await chat_with_llm(
             context_messages,
             system_prompt=_build_intent_system_prompt(
                 known_requirements,
                 pending_plan,
-                memory_summary,
             ),
             response_validator=_validate_intent_payload,
             temperature=STRUCTURED_OUTPUT_TEMPERATURE,
@@ -119,8 +134,13 @@ async def analyze_intent(
         )
         model_decision = _parse_intent_payload(response_text)
         if model_decision.intent != "uncertain":
-            # 第二步：模型给出明确意图时直接沿用其语义结果和回复。
-            return model_decision
+            # 第二步：模型给出明确意图后，仍用确定性规则保护连续旅差补充信息。
+            return _correct_intent_with_active_trip_context(
+                model_decision,
+                context_messages,
+                known_requirements=known_requirements,
+                pending_plan=pending_plan,
+            )
     except AppException as error:
         record_error(
             error,
@@ -133,7 +153,7 @@ async def analyze_intent(
         )
     # 第三步：模型不确定或调用失败时扫描当前用户整句和结构化上下文。
     return _resolve_intent_with_rules(
-        context_messages,
+        messages,
         known_requirements=known_requirements,
         pending_plan=pending_plan,
     )
@@ -167,22 +187,20 @@ async def analyze_requirements(
     intent: IntentDecision,
     known_requirements: TripRequirements | None = None,
     pending_plan: TripPlanSnapshot | None = None,
-    memory_summary: str | None = None,
 ) -> ConversationAnalysis:
     """在旅差意图确定后分析、合并和校验旅行需求。"""
 
     if intent.intent != "trip_planning":
         raise ConversationAnalysisException.invalid_model_output()
 
-    # 第一步：需求节点单独读取近期消息和快照，专注字段提取而不是重新判断意图。
-    context_messages = messages[-CONTEXT_MESSAGE_LIMIT:]
+    # 第一步：模型读取分层上下文；本地字段修复仍扫描服务端保存的完整消息。
+    context_messages = _build_agent_context(messages)
     try:
         payload = await _request_requirement_payload(
             context_messages,
             system_prompt=_build_conversation_system_prompt(
                 known_requirements,
                 pending_plan,
-                memory_summary,
             ),
             caller_name="conversation_requirement_agent",
         )
@@ -201,7 +219,7 @@ async def analyze_requirements(
         )
         requirements = _repair_missing_requirements(
             known_requirements or TripRequirements(),
-            context_messages,
+            messages,
         )
         requirements = _normalize_trip_dates(requirements)
         missing_fields = _get_missing_fields(requirements)
@@ -223,7 +241,7 @@ async def analyze_requirements(
         known_requirements,
         payload.requirements,
     )
-    requirements = _repair_missing_requirements(requirements, context_messages)
+    requirements = _repair_missing_requirements(requirements, messages)
     requirements = _normalize_trip_dates(requirements)
     plan_action = _resolve_plan_action(intent.plan_action, pending_plan)
     missing_fields = _get_missing_fields(requirements)
@@ -245,7 +263,6 @@ async def analyze_search_requirements(
     intent: IntentDecision,
     known_requirements: TripRequirements | None = None,
     pending_plan: TripPlanSnapshot | None = None,
-    memory_summary: str | None = None,
 ) -> ConversationAnalysis:
     """提取酒店或铁路直接查询所需的最小字段。"""
 
@@ -255,7 +272,7 @@ async def analyze_search_requirements(
     }:
         raise ConversationAnalysisException.invalid_model_output()
 
-    context_messages = messages[-CONTEXT_MESSAGE_LIMIT:]
+    context_messages = _build_agent_context(messages)
     try:
         payload = await _request_requirement_payload(
             context_messages,
@@ -263,7 +280,6 @@ async def analyze_search_requirements(
                 intent.intent,
                 known_requirements,
                 pending_plan,
-                memory_summary,
             ),
             caller_name=f"conversation_{intent.intent}_agent",
         )
@@ -285,7 +301,7 @@ async def analyze_search_requirements(
         )
         requirements = _repair_search_requirements(
             known_requirements or TripRequirements(),
-            context_messages,
+            messages,
         )
         requirements = _normalize_trip_dates(requirements)
         missing_fields = _get_search_missing_fields(intent.intent, requirements)
@@ -303,7 +319,7 @@ async def analyze_search_requirements(
         )
 
     requirements = _merge_requirements(known_requirements, payload.requirements)
-    requirements = _repair_search_requirements(requirements, context_messages)
+    requirements = _repair_search_requirements(requirements, messages)
     requirements = _normalize_trip_dates(requirements)
     missing_fields = _get_search_missing_fields(intent.intent, requirements)
     reply = (
@@ -328,7 +344,6 @@ async def analyze_conversation(
     *,
     known_requirements: TripRequirements | None = None,
     pending_plan: TripPlanSnapshot | None = None,
-    memory_summary: str | None = None,
 ) -> ConversationAnalysis:
     """兼容旧调用方，按意图节点和需求节点顺序完成入口分析。"""
 
@@ -337,7 +352,6 @@ async def analyze_conversation(
         messages,
         known_requirements=known_requirements,
         pending_plan=pending_plan,
-        memory_summary=memory_summary,
     )
     if intent.intent == "chat":
         return ConversationAnalysis(intent="chat", reply=intent.reply)
@@ -350,7 +364,6 @@ async def analyze_conversation(
             intent=intent,
             known_requirements=known_requirements,
             pending_plan=pending_plan,
-            memory_summary=memory_summary,
         )
     # 第二步：旅差意图进入独立需求分析，保证后续流程按状态机顺序执行。
     return await analyze_requirements(
@@ -358,22 +371,17 @@ async def analyze_conversation(
         intent=intent,
         known_requirements=known_requirements,
         pending_plan=pending_plan,
-        memory_summary=memory_summary,
     )
 
 
 def _build_intent_system_prompt(
     known_requirements: TripRequirements | None,
     pending_plan: TripPlanSnapshot | None,
-    memory_summary: str | None = None,
 ) -> str:
     """组合意图节点所需的最小状态上下文。"""
 
     # 第一步：意图节点只加载意图提示词，减少与字段分析无关的规则干扰。
     prompt_parts = [load_prompt("intent_detection_prompt.md")]
-    memory_context = build_memory_prompt_context(memory_summary)
-    if memory_context is not None:
-        prompt_parts.append(memory_context)
     if known_requirements is not None:
         snapshot = known_requirements.model_dump(
             exclude_none=True,
@@ -393,7 +401,6 @@ def _build_search_system_prompt(
     intent: str,
     known_requirements: TripRequirements | None,
     pending_plan: TripPlanSnapshot | None,
-    memory_summary: str | None = None,
 ) -> str:
     """组合直接查询节点所需的提示词和上下文。"""
 
@@ -401,9 +408,6 @@ def _build_search_system_prompt(
         load_prompt("search_requirement_prompt.md"),
         f"当前查询类型：{intent}",
     ]
-    memory_context = build_memory_prompt_context(memory_summary)
-    if memory_context is not None:
-        prompt_parts.append(memory_context)
     if known_requirements is not None:
         snapshot = known_requirements.model_dump(
             exclude_none=True,
@@ -429,14 +433,16 @@ _INTENT_RULE_PATTERNS = {
         re.IGNORECASE,
     ),
     "trip_action": re.compile(
-        r"(?:计划|打算|安排|准备|想去|出发|返程|行程|旅游|旅行|出差|游玩|去玩|"
+        r"(?:计划|打算|安排|规划|准备|想去|出发|返程|行程|旅游|旅行|出差|游玩|去玩|"
         r"玩几天|住几晚|预订|预定)"
     ),
     "trip_detail": re.compile(
         r"(?:今天|明天|后天|本周|这周|下周|"
         r"\d{4}年\d{1,2}月\d{1,2}日?|\d{1,2}月\d{1,2}日?|"
+        r"\d{1,2}[./-]\d{1,2}|"
         r"\d+(?:\.\d+)?\s*(?:天|日|周|星期|月|个月|小时)|"
-        r"\d{1,3}\s*(?:人|个人|位)|从[\u4e00-\u9fffA-Za-z·]{2,20}出发|"
+        r"(?:\d{1,3}|[零一二两三四五六七八九十百]+)\s*(?:人|个人|位)|"
+        r"(?:独自|单人|一个人|一人)|从[\u4e00-\u9fffA-Za-z·]{2,20}出发|"
         r"(?:去|到|前往)[\u4e00-\u9fffA-Za-z·]{2,20})"
     ),
     "modify": re.compile(
@@ -454,6 +460,135 @@ _INTENT_RULE_PATTERNS = {
     ),
     "question": re.compile(r"(?:什么|怎么|如何|哪里|哪些|能不能|可以吗|推荐|介绍|为什么)"),
 }
+
+
+def _correct_intent_with_active_trip_context(
+    decision: IntentDecision,
+    messages: list[ClientChatMessage],
+    *,
+    known_requirements: TripRequirements | None,
+    pending_plan: TripPlanSnapshot | None,
+) -> IntentDecision:
+    """防止模型把连续旅差会话中的确定性补充信息误判为聊天。"""
+
+    # 第一步：只有存在历史需求且当前消息包含明确字段时才纠偏，避免普通问候被强行拉进行程流程。
+    if decision.intent != "chat":
+        return decision
+    if known_requirements is None and pending_plan is None:
+        return decision
+    latest_user_text = next(
+        (
+            message.content.strip()
+            for message in reversed(messages)
+            if message.role == "user"
+        ),
+        "",
+    )
+    if not _has_trip_requirement_detail(latest_user_text):
+        return decision
+    logger.info(
+        "意图规则纠偏：model_intent=chat corrected_intent=trip_planning "
+        "has_active_trip=%s latest_message_chars=%s",
+        known_requirements is not None or pending_plan is not None,
+        len(latest_user_text),
+    )
+    return IntentDecision(
+        intent="trip_planning",
+        plan_action="modify" if pending_plan is not None else "plan",
+        reply="开始分析您补充的行程信息。",
+    )
+
+
+def _build_agent_context(
+    messages: list[ClientChatMessage],
+) -> list[ClientChatMessage]:
+    """构造分层模型上下文：最近消息完整保留，较早消息有限截断。"""
+
+    if len(messages) <= RECENT_CONTEXT_MESSAGE_LIMIT:
+        return messages
+    historical_start = len(messages) - RECENT_CONTEXT_MESSAGE_LIMIT
+    historical = messages[
+        max(0, historical_start - HISTORICAL_CONTEXT_MESSAGE_LIMIT):historical_start
+    ]
+    compact_history = [
+        ClientChatMessage(
+            role=message.role,
+            content=(
+                message.content[:HISTORICAL_MESSAGE_MAX_CHARS]
+                + "\n[较早历史消息已截短]"
+                if len(message.content) > HISTORICAL_MESSAGE_MAX_CHARS
+                else message.content
+            ),
+        )
+        for message in historical
+    ]
+    return [*compact_history, *messages[-RECENT_CONTEXT_MESSAGE_LIMIT:]]
+
+
+def _get_latest_user_text(messages: list[ClientChatMessage]) -> str:
+    """读取最后一条用户原话，供本地意图快速路径使用。"""
+
+    return next(
+        (
+            message.content.strip()
+            for message in reversed(messages)
+            if message.role == "user"
+        ),
+        "",
+    )
+
+
+def _can_resolve_intent_locally(
+    latest_user_text: str,
+    decision: IntentDecision,
+) -> bool:
+    """判断当前意图是否足够确定，可以省略一次入口 LLM 调用。"""
+
+    tags = _scan_intent_tags(latest_user_text)
+    name_update = _extract_name_from_text(latest_user_text)
+    if (
+        "greeting" in tags
+        or (
+            name_update
+            and not _has_trip_requirement_detail(latest_user_text)
+        )
+        or (
+            _NAME_MEMORY_QUESTION_PATTERN.search(latest_user_text)
+            and not _has_trip_requirement_detail(latest_user_text)
+        )
+    ):
+        return True
+    if decision.intent in {
+        "accommodation_search",
+        "intercity_transport_search",
+    }:
+        return True
+    return decision.intent == "trip_planning" and (
+        (
+            "trip_detail" in tags
+            and bool(
+                _DATE_EXPRESSION_PATTERN.search(latest_user_text)
+                or _extract_traveler_count(latest_user_text) is not None
+                or _extract_trip_duration(latest_user_text) is not None
+                or "从" in latest_user_text
+            )
+        )
+        or bool(re.search(r"(?:规划|安排|出差|旅行|旅游|行程)", latest_user_text))
+        or "modify" in tags
+        or "confirm" in tags
+    )
+
+
+def _has_trip_requirement_detail(text: str) -> bool:
+    """判断当前消息是否包含可并入旅差需求的确定性字段。"""
+
+    # 第二步：复用需求提取器，确保意图纠偏和后续字段修复使用同一套语义规则。
+    return bool(
+        _scan_intent_tags(text) & {"trip_detail", "trip_action", "modify"}
+        or _extract_traveler_count(text) is not None
+        or _extract_trip_duration(text) is not None
+        or _DATE_EXPRESSION_PATTERN.search(text)
+    )
 
 
 def _resolve_intent_with_rules(
@@ -475,19 +610,39 @@ def _resolve_intent_with_rules(
     )
     tags = _scan_intent_tags(latest_user_text)
     has_active_trip = known_requirements is not None or pending_plan is not None
-    has_trip_context = bool(tags & {"trip_action", "trip_detail"})
+    has_trip_context = _has_trip_requirement_detail(latest_user_text)
     is_modify = "modify" in tags
     is_confirm = "confirm" in tags and not is_modify
+    name_update = _extract_name_from_text(latest_user_text)
+    is_name_memory_question = bool(
+        _NAME_MEMORY_QUESTION_PATTERN.search(latest_user_text)
+    )
 
-    # 第二步：没有旅行动作的独立天气问句优先按聊天处理，避免“今天”误触发行程规划。
+    # 第二步：姓名记忆是确定性的个人闲聊，不需要交给意图模型猜测；
+    # 夹带明确行程信息时仍交给旅差意图和需求分析流程处理。
+    if (
+        (name_update or is_name_memory_question)
+        and not (has_trip_context and "trip_action" in tags)
+    ):
+        return IntentDecision(
+            intent="chat",
+            plan_action=None,
+            reply=_build_chat_reply(
+                latest_user_text,
+                messages,
+                name_update=name_update,
+            ),
+        )
+
+    # 第三步：没有旅行动作的独立天气问句优先按聊天处理，避免“今天”误触发行程规划。
     if "weather" in tags and "trip_action" not in tags and not is_modify:
         return IntentDecision(
             intent="chat",
             plan_action=None,
-            reply="我先按普通对话处理，您可以继续描述想了解的内容。",
+            reply=_build_chat_reply(latest_user_text, messages),
         )
 
-    # 第三步：独立查询优先进入专用查询分支，但明确修改方案仍属于旅差规划。
+    # 第四步：独立查询优先进入专用查询分支，但明确修改方案仍属于旅差规划。
     if "accommodation_query" in tags and not is_modify:
         return IntentDecision(
             intent="accommodation_search",
@@ -501,7 +656,7 @@ def _resolve_intent_with_rules(
             reply="开始查询飞机或火车班次信息。",
         )
 
-    # 第四步：待确认方案下的确认和修改必须优先于普通聊天标签。
+    # 第五步：待确认方案下的确认和修改必须优先于普通聊天标签。
     if pending_plan is not None and is_confirm:
         return IntentDecision(
             intent="trip_planning",
@@ -515,7 +670,7 @@ def _resolve_intent_with_rules(
             reply="开始分析您的行程调整。",
         )
 
-    # 第五步：没有活动行程时，旅行动作必须和日期、人数、地点等细节形成有效句式。
+    # 第六步：没有活动行程时，旅行动作必须和日期、人数、地点等细节形成有效句式。
     if "trip_action" in tags and "trip_detail" in tags:
         return IntentDecision(
             intent="trip_planning",
@@ -528,18 +683,24 @@ def _resolve_intent_with_rules(
             plan_action="modify" if pending_plan is not None else "plan",
             reply="开始分析您补充的行程信息。",
         )
+    if has_trip_context and "trip_action" in tags:
+        return IntentDecision(
+            intent="trip_planning",
+            plan_action="plan",
+            reply="开始分析需求。",
+        )
 
-    # 第六步：规则只对简单问候直接生成安全回复；其他普通聊天由兜底回复保守承接。
+    # 第七步：简单问候和普通闲聊都返回自然承接文案，不再暴露内部“意图兜底”。
     if "greeting" in tags:
         return IntentDecision(
             intent="chat",
             plan_action=None,
-            reply="您好！有什么可以帮您的吗？",
+            reply=_build_chat_reply(latest_user_text, messages),
         )
     return IntentDecision(
         intent="chat",
         plan_action=None,
-        reply="我先按普通对话处理，您可以继续描述想了解的内容。",
+        reply=_build_chat_reply(latest_user_text, messages),
     )
 
 
@@ -554,19 +715,67 @@ def _scan_intent_tags(text: str) -> set[str]:
     }
 
 
+def _extract_name_from_text(text: str) -> str | None:
+    """提取用户最新的自称或希望助手使用的称呼。"""
+
+    match = _NAME_UPDATE_PATTERN.search(text)
+    if match is None:
+        return None
+    name = match["name"].strip()
+    name = re.sub(r"(?:吧|呀|哦|呢)$", "", name)
+    if name.startswith(("什么", "啥")) or name.endswith(("吗", "呢")):
+        return None
+    return name or None
+
+
+def _get_known_user_name(messages: list[ClientChatMessage]) -> str | None:
+    """按时间顺序读取最近一次用户指定的称呼。"""
+
+    name: str | None = None
+    for message in messages:
+        if message.role != "user":
+            continue
+        name = _extract_name_from_text(message.content) or name
+    return name
+
+
+def _build_chat_reply(
+    latest_user_text: str,
+    messages: list[ClientChatMessage],
+    *,
+    name_update: str | None = None,
+) -> str:
+    """生成不暴露内部路由状态的轻量闲聊回复。"""
+
+    known_name = name_update or _get_known_user_name(messages)
+    if _NAME_MEMORY_QUESTION_PATTERN.search(latest_user_text):
+        return (
+            f"当然记得，你希望我叫你{known_name}。"
+            if known_name
+            else "你还没有告诉我希望使用什么称呼，告诉我之后我就记住了。"
+        )
+    if name_update:
+        return f"好的，我记住了，之后叫你{name_update}。"
+    if "greeting" in _scan_intent_tags(latest_user_text):
+        return (
+            f"你好，{known_name}！今天想聊点什么？"
+            if known_name
+            else "你好！今天想聊点什么？"
+        )
+    if known_name:
+        return f"好的，{known_name}。你想继续聊天，还是开始规划一段行程？"
+    return "好的，我在听。你可以继续和我聊天，也可以直接告诉我想规划的目的地和时间。"
+
+
 def _build_conversation_system_prompt(
     known_requirements: TripRequirements | None,
     pending_plan: TripPlanSnapshot | None = None,
-    memory_summary: str | None = None,
 ) -> str:
     """组合需求分析节点指令与可选需求快照。"""
 
     # 第一步：固定指令定义意图边界和结构化输出契约。
     prompt = load_prompt("conversation_entry_prompt.md")
     prompt_parts = [prompt]
-    memory_context = build_memory_prompt_context(memory_summary)
-    if memory_context is not None:
-        prompt_parts.append(memory_context)
     if known_requirements is not None:
         # 第二步：仅注入已确认字段，且明确当前消息优先于历史快照。
         snapshot = known_requirements.model_dump(
@@ -694,7 +903,8 @@ _DATE_EXPRESSION_PATTERN = re.compile(
     r"(今天|明天|后天|"
     r"(?:本周|这周|下周)(?:周|星期)?[一二三四五六日天]|"
     r"\d{4}年\d{1,2}月\d{1,2}日?|"
-    r"\d{1,2}月\d{1,2}日?)"
+    r"\d{1,2}月\d{1,2}日?|"
+    r"\d{1,2}[./-]\d{1,2})"
 )
 _TRAVELER_COUNT_PATTERN = re.compile(
     r"(?P<count>\d{1,3}|[零一二两三四五六七八九十百]+)\s*(?:个人|人|名同行者|位同行者)"
@@ -702,6 +912,14 @@ _TRAVELER_COUNT_PATTERN = re.compile(
 _DURATION_PATTERN = re.compile(
     r"(?P<amount>\d+(?:\.\d+)?|[零一二两三四五六七八九十百]+)"
     r"\s*(?P<unit>天|日|晚|周|星期|个月|月|小时)"
+)
+_NAME_UPDATE_PATTERN = re.compile(
+    r"(?:我叫|叫我|称呼我为|你还是叫我)"
+    r"(?P<name>[\u4e00-\u9fffA-Za-z0-9·]{1,20}?)"
+    r"(?=吧|呀|哦|呢|[，,。！？!?\s]|$)"
+)
+_NAME_MEMORY_QUESTION_PATTERN = re.compile(
+    r"(?:记得|还记得|知道).{0,8}(?:我叫什么|我的名字|怎么称呼我)"
 )
 _ORIGIN_PATTERN = re.compile(
     r"从(?P<origin>[\u4e00-\u9fffA-Za-z·]{2,30}?)(?="
@@ -812,7 +1030,7 @@ def _get_search_missing_fields(
     intent: str,
     requirements: TripRequirements,
 ) -> list[str]:
-    """按查询类型计算进入 MCP 查询所需的最低字段。"""
+    """按查询类型计算进入查询 Tool 所需的最低字段。"""
 
     if intent == "accommodation_search":
         missing_fields = [
@@ -1011,6 +1229,19 @@ def _normalize_trip_date(
             reference_date.year,
             int(month_day["month"]),
             int(month_day["day"]),
+        )
+        if iso_date is not None and date.fromisoformat(iso_date) >= reference_date:
+            return iso_date
+    # 第五步：兼容用户常用的 9.1、9/1 和 9-1 简写日期。
+    numeric_month_day = re.fullmatch(
+        r"(?P<month>\d{1,2})[./-](?P<day>\d{1,2})",
+        normalized_value,
+    )
+    if numeric_month_day is not None:
+        iso_date = _build_iso_date(
+            reference_date.year,
+            int(numeric_month_day["month"]),
+            int(numeric_month_day["day"]),
         )
         if iso_date is not None and date.fromisoformat(iso_date) >= reference_date:
             return iso_date

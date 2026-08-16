@@ -1,378 +1,500 @@
 # TripWeave - 旅差智能助手
 
-## 当前 Demo
+> 当前文档按代码实际状态维护，最近核对日期：2026-08-16。
 
-第一版已提供一个最小可用的 Agent 对话 Demo：
+## 1. 当前状态
 
-- 前端：React + Vite 中文聊天界面
-- 后端：FastAPI 的 `POST /api/v1/chat/messages`
-- 模型：支持 DeepSeek、OpenAI 与 OpenAI 兼容第三方中转站
-- 会话：仅保存在浏览器当前页面，不写入数据库
-- 统一入口 Agent：一次调用判断普通聊天或旅差规划，并在旅差场景提取结构化需求
-- 身份与行为约束：由后端全局系统提示词和 Agent 专用系统提示词共同注入
+TripWeave 当前是一个以对话为入口的旅差规划 Demo：
 
-### 当前子智能体逻辑（截至 2026-08-14）
+- 前端使用 React、TypeScript 和 Vite，提供聊天窗口、失败重试和旅差需求快捷补充面板。
+- 后端使用 FastAPI，入口为 `POST /api/v1/chat/messages`。
+- 后端使用 LangGraph 编排意图判断、需求分析、规划、工具查询、规则校验、审核和确认流程。
+- 大模型客户端使用 OpenAI 兼容协议，当前可配置 DeepSeek、OpenAI 和第三方代理供应商。
+- 通过 `conversation_id` 关联 LangGraph `thread_id`，工作流状态由 SQLite Checkpointer 持久化。
+- 服务端 SQLite Checkpointer 保存会话历史；浏览器回传的本地上下文窗口只作为兼容输入。
+- 高德和风天气能力通过后端 Tools 调用；酒店和城际交通当前使用本地估算 Tools，不代表实时价格、库存或余票。
+- 用户确认方案后，后端异步补充 Unsplash 景点/美食图片和高德城市内路线摘要，并通过 `confirmed_plan.details` 返回前端。
+- 当前只生成推荐方案，不执行真实购票、订房或支付。
 
-当前运行时已接通两个 Agent：统一入口 Agent 负责意图判断、需求提取与关键追问；完整旅差需求会经 LangGraph 进入规划 Agent。规划 Agent 调用高德地点/路线、住宿/景点/餐饮 POI 与和风天气工具，收敛可信证据后生成方案。
+当前默认可以只配置 DeepSeek。未配置的备用供应商会被跳过；所有供应商都不可用时，接口会返回统一业务错误。
+
+## 2. 当前运行流程
+
+### 2.1 主流程
 
 ```mermaid
 flowchart TD
-    A["浏览器发送 messages"] --> B["POST /api/v1/chat/messages"]
-    B --> C["统一入口 Agent"]
-    C --> D["chat_with_llm"]
-    D --> E["全局 system prompt + Agent system prompt"]
-    E --> F["按供应商顺序调用模型"]
-    F --> G["响应清洗与 JSON/Pydantic 校验"]
-    G --> H{"intent"}
-    H -- "chat" --> I["返回普通聊天回复"]
-    H -- "trip_planning" --> J["提取 TripRequirements"]
-    J --> K["本地计算缺失字段与完整性"]
-    K --> M{"需求完整？"}
-    M -- "否" --> L["返回关键追问"]
-    M -- "是" --> N["规划 Agent 与可信 Tools"]
-    N --> O["返回旅差方案"]
-    I --> P["返回 analysis"]
-    L --> P
-    O --> P
+    A["用户消息"] --> B["POST /api/v1/chat/messages"]
+    B --> C["合并服务端历史、客户端窗口与需求快照"]
+    C --> D["LangGraph"]
+    D --> E["意图判断 Agent"]
+    E -- "chat" --> F["直接返回聊天回复"]
+    E -- "trip_planning" --> G["需求分析 Agent"]
+    G --> H{"需求完整？"}
+    H -- "否" --> I["返回一个关键追问"]
+    I --> A
+    H -- "是" --> J["规划 Agent"]
+    J --> K["并行收集高德、天气和本地路线证据"]
+    K --> L["生成旅差方案草案"]
+    L --> M["Rule Validation"]
+    M --> N["审核总结 Agent"]
+    N --> O{"审核状态"}
+    O -- "ready_for_confirmation" --> P["返回待确认方案"]
+    O -- "needs_replanning" --> Q{"重规划次数 < 2？"}
+    Q -- "是" --> R["压缩审核反馈"]
+    R --> J
+    Q -- "否" --> S["返回风险与待用户决策项"]
+    O -- "needs_user_decision" --> S
+    P --> T{"用户下一轮动作"}
+    T -- "修改" --> G
+    T -- "确认" --> U["生成 ConfirmedTripPlan"]
+    U --> V["Unsplash 图片 + 高德路线取证"]
+    V --> W["前端展示完整确认方案"]
 ```
 
-入口 Agent 的输出为 `ConversationAnalysis`：
+### 2.2 直接查询分支
 
-| 字段 | 含义 |
-| --- | --- |
-| `intent` | `chat` 或 `trip_planning` |
-| `reply` | 可直接展示给用户的中文回复 |
-| `requirements` | 仅旅差规划场景返回的 `TripRequirements`；普通聊天为 `null` |
-| `missing_fields` | 本地规则计算出的缺失核心字段 |
-| `is_complete` | 旅差需求是否已达到进入后续规划的最低条件；普通聊天为 `null` |
+统一入口还支持两个不进入完整行程规划的查询意图：
 
-当前最低完整条件为：目的地、出发时间、返程时间或旅行天数、出行人数。信息不足时，入口 Agent 只追问最关键的一项。
+```mermaid
+flowchart LR
+    A["用户消息"] --> B["意图判断 Agent"]
+    B -- "accommodation_search" --> C["直接查询需求分析"]
+    C --> D["住宿查询 Agent"]
+    B -- "intercity_transport_search" --> E["直接查询需求分析"]
+    E --> F["城际交通查询 Agent"]
+    D --> G["返回酒店查询结果"]
+    F --> H["返回飞机/火车查询结果"]
+```
 
-旅行时长使用 `TripDuration` 对象表达，而不是展示字符串：
+直接查询字段不足时，系统只追问查询所需的最小字段。查询失败会返回明确的不可用状态，不会伪装成实时结果。
+
+## 3. Agent 与工作流职责
+
+| 组件 | 当前职责 | 当前状态 |
+| --- | --- | --- |
+| 意图判断 Agent | 区分普通聊天、旅差规划、酒店查询、城际交通查询，并识别确认或修改动作 | 已实现 |
+| 需求分析 Agent | 提取并合并 `TripRequirements`，补充日期和时长归一化，按本地规则计算缺失字段 | 已实现 |
+| 规划 Agent | 收集可信工具证据，再由模型生成 Markdown 方案草案；支持审核反馈和用户修改触发的重规划 | 已实现 |
+| 住宿查询 Agent | 通过本地酒店估算 Tool 生成价格、房型和库存参考 | 已实现 |
+| 城际交通查询 Agent | 通过本地交通估算 Tool 生成飞机和火车班次参考 | 已实现 |
+| 审核总结 Agent | 根据方案、规则校验和工具证据生成总结、风险和待确认项；状态仍由本地规则决定 | 已实现 |
+| 会话历史策略 | Checkpointer 保存最多 120 条；模型每次读取最近 8 条和其外 6 条历史，不调用摘要 Agent | 已实现 |
+| 用户确认 | 由 LangGraph 节点处理，确认后生成带图片和路线详情的 `ConfirmedTripPlan` | 已实现 |
+
+吃、住、行、景点和天气不再拆成独立业务 Agent。规划取证层通过 Tools 调用这些能力，减少多 Agent 转发和自由文本传递。
+
+### 3.1 规划 Agent 的实际调用方式
+
+当前规划 Agent 不是模型原生 `tool_calls` 自主循环，而是由后端代码先完成取证，再把压缩后的证据交给模型生成方案：
+
+1. 校验需求完整性。
+2. 调用地图地理编码获取目的地坐标。
+3. 并发查询住宿、景点和餐饮 POI。
+4. 按候选地点计算少量本地交通路线。
+5. 在出发日期落入未来十天窗口时查询天气；超出窗口则明确标记为不可用或跳过。
+6. 将需求、工具证据和有限的重规划反馈交给规划模型。
+7. 生成非空 Markdown 方案草案。
+
+因此，当前 Tools 是后端规划取证层的可靠数据源，规划模型负责解释和编排，不直接控制外部 API 或浏览器。
+
+## 4. 核心契约
+
+### 4.1 `ConversationAnalysis`
+
+```text
+intent:
+  chat
+  trip_planning
+  accommodation_search
+  intercity_transport_search
+reply: str
+requirements: TripRequirements | null
+plan_action: plan | modify | confirm | null
+pending_plan: TripPlanSnapshot | null
+confirmed_plan: ConfirmedTripPlan | null
+missing_fields: list[str]
+is_complete: bool | null
+```
+
+普通聊天不能携带 `requirements`。旅差规划和直接查询意图必须携带结构化需求对象。`missing_fields` 和 `is_complete` 由后端本地规则计算，不能仅信任模型自行判断。
+
+### 4.2 `TripRequirements`
+
+```text
+origin: str | null
+destination: str | null
+departure_date: str | null
+return_date: str | null
+trip_duration: TripDuration | null
+traveler_count: int | null
+budget: str | null
+transport_preferences: list[str]
+accommodation_preferences: list[str]
+dining_preferences: list[str]
+attraction_preferences: list[str]
+general_preferences: list[str]
+fixed_schedule: list[str]
+```
+
+进入完整旅差规划的最低字段为：
+
+- `destination`
+- `departure_date`
+- `return_date` 或 `trip_duration`
+- `traveler_count`
+
+### 4.3 旅行时长
+
+旅行时长保留用户原始表达，并使用结构化单位：
 
 ```json
 {
-  "raw_text": "一个月",
+  "raw_text": "一周",
   "amount": 1,
-  "unit": "month",
+  "unit": "week",
   "is_approximate": false
 }
 ```
 
-`raw_text` 保留用户表达；`amount` 与 `unit` 供后续规划使用，单位只能是 `hour`、`day`、`week` 或 `month`。例如“半天”为 `0.5 + day`，“一周”为 `1 + week`，“一个月”为 `1 + month`。周和月不预先折算为固定天数，后续在已知出发日期时按日历规则计算。
+`unit` 只能是 `hour`、`day`、`week` 或 `month`。例如：
 
-### 已实现与未实现边界
+- “半天”表示 `0.5 + day`
+- “三天”表示 `3 + day`
+- “一周”表示 `1 + week`
+- “一个月”表示 `1 + month`
 
-| 状态 | 内容 |
+周和月不会在需求分析阶段强行折算成固定天数；在已有出发日期时，规划层再按日历语义计算。无法可靠识别的相对日期会保留原文，不会编造具体日期。
+
+### 4.4 方案确认状态
+
+`ReviewResult.status` 由本地规则计算：
+
+| 状态 | 含义 |
 | --- | --- |
-| 已实现 | 统一入口 Agent、LangGraph 两节点路由、规划 Agent、结构化需求提取、全局/Agent 系统提示词、LLM 重试与供应商切换、高德地点/路线与 POI 工具、和风天气工具、前端失败回合重试、行程快速补充面板、工具和 Agent 单元测试 |
-| 未实现 | 共享状态持久化、城市间实时票价与库存、规则校验/审核 Agent、数据库、Redis、`/api/v1/trips` 接口、端到端测试与 Docker 部署 |
+| `ready_for_confirmation` | 没有阻断性硬错误，返回待用户确认方案 |
+| `needs_replanning` | 存在可自动修复的问题，最多自动重规划 2 次 |
+| `needs_user_decision` | 存在无法由系统安全修复的问题，返回风险和待用户决策项 |
 
-### 启动
+模型只负责生成审核摘要、风险和待确认项，不能自行修改审核状态或绕过硬约束。
 
-1. 在 `backend` 目录创建 `.env`，选择模型供应商并填写对应配置：
+确认成功后，`ConversationAnalysis.confirmed_plan` 会额外包含：
 
-   ```powershell
-   Copy-Item .env.example .env
-   ```
+- `details.images`：Unsplash 景点和美食图片、缩略图、描述、摄影者和来源链接。
+- `details.routes`：从目的地中心到代表性景点/餐饮候选的公交、步行和驾车路线摘要。
+- `details.tool_status`：`available`、`unavailable` 或 `skipped`，第三方不可用时不阻断确认。
 
-   编辑 `backend/.env`，设置：
+## 5. 记忆与请求状态
 
-   ```dotenv
-   LLM_PROVIDER=deepseek
-   DEEPSEEK_API_KEY=你的密钥
-   ```
+当前没有业务数据库、Redis 或独立长期记忆服务。系统分为两层状态：
 
-2. 启动后端：
+- LangGraph 工作流状态和会话历史：由服务端 SQLite Checkpointer 持久化。
+- 浏览器兼容窗口：由前端回传最近 8 条消息。
 
-   ```powershell
-   cd backend
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   pip install -r requirements.txt
-   uvicorn app.main:app --reload --port 8000
-   ```
+前端保存并回传：
 
-3. 新开一个终端，启动前端：
+- `short_term_memory`：最近 8 条消息；`summary` 仅为旧客户端兼容字段。
+- `conversation_id`：服务端创建的会话 ID，后续请求必须保持不变。
 
-   ```powershell
-   cd frontend
-   npm install
-   npm run dev
-   ```
+`known_requirements` 和 `pending_plan` 仍被后端接受，用于兼容旧客户端；当前前端不再依赖它们作为恢复待确认方案的唯一来源。
 
-浏览器打开 Vite 显示的地址，默认通常为 `http://localhost:5173`。后端健康检查为 `http://127.0.0.1:8000/api/v1/health`，也可访问 `http://127.0.0.1:8000/health`。
+后端每轮会：
 
-### 配置
+1. 根据 `conversation_id` 从 Checkpointer 读取服务端历史。
+2. 将服务端历史和本轮客户端消息按重叠后缀合并，避免重复。
+3. 服务端最多保留 120 条消息，并将本轮助手回复写回 Checkpointer。
+4. 入口 Agent 每次把最近 8 条消息完整传给模型，再附加其外 6 条较早历史；较早助手长回复会截短。
+5. 结构化 `TripRequirements`、`pending_plan` 和 `review_result` 作为稳定业务记忆，不依赖自然语言历史猜测。
 
-后端从 `backend/.env` 读取以下变量：
+完整方案不依赖助手长文本记忆保存，而是由 Checkpointer 按 `conversation_id` 保存。服务重启后，使用同一会话 ID 可以恢复待确认方案、审核状态和历史消息。
 
-| 变量 | 默认值 | 用途 |
+### 5.1 成本控制策略
+
+- 纯问候、明确人数/日期/时长补充、明确酒店或交通查询等确定性意图优先由本地规则处理，跳过一次意图判断 LLM。
+- 需求分析 Agent 仍保留，用于理解预算、偏好、纠错和自然语言字段合并。
+- 规划 Agent 仍保留，用于根据 Tools 证据生成完整方案。
+- 审核总结 Agent 保留，用于整理方案风险和用户可读结论；审核状态由本地规则校验，模型不能越权改变分支。
+- `accommodation_search_agent.py` 和 `intercity_transport_search_agent.py` 当前只是查询适配器，不调用 LLM；后续可在目录清理时改名为 service，但不会产生模型成本。
+
+### 5.2 Checkpointer 生命周期
+
+- 首次请求未携带 `conversation_id` 时，后端生成 UUID。
+- 后续请求将该 UUID 作为 LangGraph 的 `thread_id`。
+- 默认检查点文件为 `backend/data/tripweave_checkpoints.sqlite`。
+- FastAPI 启动时打开 SQLite 连接并初始化表结构，关闭时释放连接。
+- 当前审批等待仍以 `await_confirmation` 节点结束本轮请求；下一轮使用同一会话 ID恢复状态。后续如需真正的 `interrupt()` 恢复协议，可在此基础上扩展。
+
+## 6. Tools 与外部集成
+
+### 6.1 本地 Tools
+
+| 文件 | 能力 |
+| --- | --- |
+| `backend/app/tools/map_route_tool.py` | 高德地理编码、POI、步行/公交/驾车/骑行路线 |
+| `backend/app/tools/poi_search.py` | 城市和周边 POI 查询公共封装 |
+| `backend/app/tools/accommodation_tool.py` | 住宿 POI 查询，不代表真实价格或库存 |
+| `backend/app/tools/attraction_tool.py` | 景点 POI 查询，不代表门票或开放状态 |
+| `backend/app/tools/food_tool.py` | 餐饮 POI 查询，不代表评分或营业状态 |
+| `backend/app/tools/hotel_search_tool.py` | 本地酒店价格估算，不访问实时 API |
+| `backend/app/tools/traffic_search_tool.py` | 本地飞机/高铁价格估算，不代表实时票价或余票 |
+| `backend/app/tools/transport_tool.py` | 本地交通方式规划和不可用方式收敛 |
+| `backend/app/tools/weather_tool.py` | 和风天气实时天气、逐日/逐小时预报和预警 |
+
+### 6.2 确认方案服务
+
+| 文件 | 能力 |
+| --- | --- |
+| `backend/app/services/unsplash_service.py` | 后端异步搜索 Unsplash 图片并提取安全展示字段 |
+| `backend/app/services/confirmed_trip_service.py` | 确认后并发收集图片和高德路线，统一降级为可展示状态 |
+
+### 6.3 LLM 集成
+
+`backend/app/integrations/llm/` 负责：
+
+- 主供应商和备用供应商路由。
+- 当前供应商内重试。
+- OpenAI 兼容请求封装。
+- JSON 响应清洗和结构化契约校验。
+- 原始请求/响应调试日志开关。
+- 日志脱敏。
+
+`response_cleaner.py` 会处理 BOM、零宽字符、不换行空格、首尾空白、Markdown JSON 代码围栏和 JSON 前置说明，但不会猜测性修复任意业务字段。
+
+## 7. 启动
+
+### 7.1 后端
+
+在 `backend` 目录创建 `.env`：
+
+```powershell
+cd backend
+Copy-Item .env.example .env
+```
+
+至少配置一个模型：
+
+```dotenv
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=你的密钥
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
+```
+
+创建环境并启动：
+
+```powershell
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
+
+后端地址默认是 `http://127.0.0.1:8000`，健康检查：
+
+```text
+http://127.0.0.1:8000/api/v1/health
+```
+
+也支持：
+
+```powershell
+python -m app.main
+```
+
+### 7.2 前端
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+前端默认地址为 `http://localhost:5173`。如后端地址不同，可设置：
+
+```powershell
+$env:VITE_API_BASE_URL="http://127.0.0.1:8000"
+npm run dev
+```
+
+生产构建：
+
+```powershell
+npm run build
+```
+
+## 8. 配置
+
+完整模板位于 `backend/.env.example`。常用配置如下：
+
+| 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `LLM_PROVIDER` | `deepseek` | 当前供应商：`deepseek`、`openai` 或 `proxy` |
-| `LLM_FALLBACK_PROVIDERS` | `openai,proxy` | 主供应商可恢复失败后的备用供应商顺序 |
-| `LLM_MAX_RETRIES` | `3` | 非入口调用在可恢复错误时的默认最大调用次数；统一入口为保障交互速度最多尝试 2 次 |
-| `LLM_DEBUG_LOG_RAW_OUTPUT` | `false` | 在结构化契约或上游响应校验失败时记录模型原始响应，排障完成后应关闭 |
-| `LLM_DEBUG_LOG_RAW_REQUEST` | `false` | 仅在结构化契约校验失败时记录 Agent 请求上下文和生成参数，排障完成后应关闭 |
-| `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | - | `LLM_PROVIDER=deepseek` 时必填 |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | - | `LLM_PROVIDER=openai` 时必填 |
-| `PROXY_API_KEY` / `PROXY_BASE_URL` / `PROXY_MODEL` | - | `LLM_PROVIDER=proxy` 时必填，第三方中转站需兼容 OpenAI Chat Completions API |
+| `LLM_PROVIDER` | `deepseek` | 主模型供应商：`deepseek`、`openai` 或 `proxy` |
+| `LLM_FALLBACK_PROVIDERS` | 空或按模板配置 | 备用供应商顺序，仅已配置供应商会调用 |
+| `LLM_MAX_RETRIES` | `3` | 单供应商可恢复错误的最大尝试次数 |
+| `LLM_DEBUG_LOG_RAW_OUTPUT` | `false` | 契约失败时记录脱敏后的模型原始响应 |
+| `LLM_DEBUG_LOG_RAW_REQUEST` | `false` | 契约失败时记录 Agent 请求上下文和生成参数 |
+| `DEEPSEEK_API_KEY` | - | DeepSeek API Key |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek 基础地址 |
+| `DEEPSEEK_MODEL` | - | 普通 Agent 使用的 DeepSeek 模型 |
+| `DEEPSEEK_REVIEW_MODEL` | `deepseek-v4-pro` | 审核总结 Agent 使用的模型 |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | - | OpenAI 配置 |
+| `PROXY_API_KEY` / `PROXY_BASE_URL` / `PROXY_MODEL` | - | OpenAI 兼容中转站配置 |
+| `AMAP_WEB_SERVICE_KEY` | - | 高德 Web 服务 Key |
+| `AMAP_WEB_SERVICE_BASE_URL` | `https://restapi.amap.com` | 高德服务地址 |
+| `QWEATHER_API_HOST` | - | 和风天气控制台分配的专属 Host |
+| `QWEATHER_API_KEY` | - | 和风天气服务端 Key |
+| `UNSPLASH_ACCESS_KEY` | - | Unsplash 图片搜索 Access Key |
+| `UNSPLASH_BASE_URL` | `https://api.unsplash.com` | Unsplash API 地址 |
+| `LANGGRAPH_CHECKPOINT_PATH` | `data/tripweave_checkpoints.sqlite` | LangGraph SQLite 检查点文件，相对 `backend` 目录 |
 | `CORS_ALLOW_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | 允许访问后端的前端地址 |
 | `LOG_MAX_BYTES` | `1048576` | 单个日志文件最大字节数 |
-| `LOG_BACKUP_COUNT` | `5` | 单次启动日志文件滚动保留数量 |
+| `LOG_BACKUP_COUNT` | `5` | 日志滚动保留数量 |
 
-前端可选通过 `VITE_API_BASE_URL` 指向不同的后端地址；默认使用 `http://127.0.0.1:8000`。
+日志默认写入 `backend/app/logs/`，文件名包含启动时间。正常日志只记录请求 ID、调用阶段、耗时、结果形态、数量和错误摘要，不记录密钥。
 
-后端日志写入 `backend/app/logs/`，文件名使用启动时间戳，例如 `20260813_203000.log`，超过 `LOG_MAX_BYTES` 后自动滚动新文件。
+调试模型契约时可以临时开启：
 
-调用顺序由 `LLM_PROVIDER` 加上 `LLM_FALLBACK_PROVIDERS` 决定。连接失败、超时、429 或 5xx 时，系统会在当前供应商内最多尝试 `LLM_MAX_RETRIES` 次，再按顺序切换到下一个供应商。统一入口为避免结构化异常造成长时间阻塞，最多尝试 2 次；领域契约失败的第二次调用会追加格式约束，耗尽次数才切换备用供应商。配置缺失的供应商会被跳过；认证失败和其他 4xx 请求错误不会切换。
-
-结构化响应调用会启用 OpenAI 兼容的 JSON Output（`response_format: {"type": "json_object"}`）、低温度 `0.1` 和 `768` token 上限。文本清洗位于 `backend/app/integrations/llm/response_cleaner.py`，会处理 BOM、零宽字符、不换行空格、首尾空白、Markdown JSON 代码围栏和 JSON 前置说明；统一入口会把旧版的 `3`、`"3天"`、`"半天"`、`"一周"` 和 `"一个月"` 等无歧义时长转换为 `TripDuration` 对象，保留天、周、月等单位语义，不会猜测性修复其他业务数据。默认日志仅记录请求 ID、无原文的会话元数据、响应长度/指纹/形态、规范化计数和 Pydantic 字段错误摘要。兼容客户端会将 HTTP 200 但 `content` 为空、缺失或响应结构异常的情况前移识别为可恢复坏响应，并记录 `finish_reason`、上游请求 ID、内容长度、`reasoning_content` 长度和用量摘要。若需查看失败现场，可临时将 `LLM_DEBUG_LOG_RAW_OUTPUT=true` 和/或 `LLM_DEBUG_LOG_RAW_REQUEST=true` 写入 `backend/.env` 后重启后端；前者会在上游响应或结构化契约校验失败时输出脱敏后的模型原始响应，后者会在契约失败时输出 Agent 实际传入的系统提示词、消息和生成参数，不包含 HTTP `Authorization` 请求头或已配置的供应商密钥。两项开关会记录对话内容，应仅用于本地或受控排障环境，完成后立即关闭。
-
-前端请求失败时会将最后一条用户消息标记为失败，并提供重试操作；在失败回合完成前，新的输入不会提交给后端。每次请求仅发送最近 8 条消息；旅差场景同时发送上轮已确认的 `known_requirements` 快照，后端将快照作为系统上下文补充，且最新用户输入优先于快照。
-
-当响应 `analysis.intent` 为 `trip_planning` 时，前端会显示“快速补充”面板，并根据 `requirements` 回填出发地、目的地、人数、预算、交通、偏好和旅行时长。面板支持日期区间、预算口径及交通/偏好选择；提交时会合成为一条自然语言用户消息，仍调用既有 `POST /api/v1/chat/messages`，不会新增独立的前端或后端需求状态。
-
----
-
-## 1. 项目概述
-
-TripWeave 是一个旅差智能助手。当前运行时以统一入口 Agent 处理普通聊天和旅差需求收集；目标架构将基于 LangGraph 扩展为多智能体协作，由多个专业 Agent 完成目的地、交通、行程与酒店方案规划。
-
-项目第一阶段聚焦“方案规划与推荐”，不直接完成机票、火车票或酒店的真实下单；后续可接入供应商 API 扩展预订能力。
-
-## 2. 用户需求
-
-### 2.1 目标用户
-
-- 有出差安排的职场用户
-- 需要组合规划交通、酒店和游玩活动的个人旅行用户
-- 需要快速生成可执行行程的行政或助理角色
-
-### 2.2 核心用户流程
-
-```mermaid
-flowchart LR
-    A["用户输入自然语言计划"] --> B["信息抽取与意图识别"]
-    B --> C{"关键信息完整？"}
-    C -- "否" --> D["追问缺失约束"]
-    D --> B
-    C -- "是" --> E["多智能体并行规划"]
-    E --> F["冲突校验与方案整合"]
-    F --> G["展示行程、酒店与预算"]
-    G --> H["用户修改偏好或确认"]
-    H --> E
+```dotenv
+LLM_DEBUG_LOG_RAW_OUTPUT=true
+LLM_DEBUG_LOG_RAW_REQUEST=true
 ```
 
-### 2.3 用户输入信息
+这两个开关可能记录对话内容，只能在本地或受控环境使用，排障完成后应关闭并重启后端。
 
-| 类型 | 信息 |
-| --- | --- |
-| 核心信息 | 出发地、目的地或候选城市、出行日期、返程日期、出行人数 |
-| 出差约束 | 会议/客户地点、固定日程、公司差旅标准、报销规则 |
-| 偏好信息 | 交通偏好、酒店星级、预算、饮食、景点类型、行程节奏 |
-| 可选信息 | 航班/车次偏好、会员权益、无障碍需求、同行人偏好 |
+## 9. API
 
-### 2.4 MVP 功能
+### 9.1 已实现接口
 
-- 用自然语言解析出行计划并结构化保存
-- 自动追问缺失的关键条件
-- 根据地点、日期和预算生成交通建议
-- 编排按天、按时间段的行程
-- 按位置、预算、评分和设施筛选酒店
-- 输出预算估算、时间冲突和风险提示
-- 支持对日期、预算、酒店或日程进行局部重规划
-
-### 2.5 后续功能
-
-- 接入高德地图、航旅/铁路、酒店与天气等实时数据
-- 多方案对比与一键替换
-- 企业差旅政策、审批流和费用归集
-- 真实预订、订单管理和行程提醒
-- 用户画像、历史偏好与长期记忆
-
-## 3. 技术栈
-
-当前 Demo 已实际使用 Python、FastAPI、Pydantic、httpx、LangGraph、高德地图、和风天气、React、TypeScript 和 Vite。LangChain、数据库、缓存、Docker 与端到端测试仍属于后续目标。
-
-| 分层 | 技术选择 | 用途 |
+| 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| 后端语言 | Python 3.12+ | AI 编排、服务接口与数据处理 |
-| 多智能体编排 | LangGraph | 管理共享状态、节点路由、并行协作与重规划循环 |
-| LLM 应用层 | LangChain | 模型调用、提示词、结构化输出和工具封装 |
-| 大模型 | 可配置的 OpenAI 兼容模型 | 意图理解、约束提取、推理与方案生成 |
-| API 服务 | FastAPI + Uvicorn | 提供聊天、计划、确认与重规划接口 |
-| 数据校验 | Pydantic v2 | 定义请求、领域模型和 Agent 输出契约 |
-| 数据库 | PostgreSQL | 保存用户、旅行计划、候选方案与确认记录 |
-| 缓存/任务 | Redis | 缓存热点数据、会话状态与异步任务队列 |
-| ORM/迁移 | SQLAlchemy + Alembic | 数据访问与数据库版本迁移 |
-| 外部工具 | 地图、天气、交通、酒店 API | 地理检索、路线、价格、库存与天气数据 |
-| 前端 | React + TypeScript + Vite | 旅行对话、方案编辑与时间轴展示 |
-| UI | Tailwind CSS + shadcn/ui | 构建清晰、可维护的业务界面 |
-| 测试 | Pytest、httpx、Playwright | 单元、接口和端到端测试 |
-| 工程化 | Docker Compose、Ruff、Pyright、pre-commit | 本地一致性、代码质量与部署基础 |
+| `POST` | `/api/v1/chat/messages` | 提交本轮消息并返回 `analysis` 与 `short_term_memory` |
+| `GET` | `/api/v1/health` | 服务健康检查 |
 
-## 4. 多智能体设计
+### 9.2 请求示例
 
-除统一入口 Agent 外，本节其余角色与 LangGraph 流程均为后续目标设计。
-
-### 4.1 Agent 职责
-
-| Agent | 输入 | 输出 | 主要职责 |
-| --- | --- | --- | --- |
-| 统一入口 / 需求分析 Agent | 用户消息、近期上下文、已有 `TripRequirements` | `ConversationAnalysis`、`TripRequirements` | 判断聊天或旅差规划，更新需求并追问缺失字段 |
-| 任务拆分规划 Agent | 完整 `TripRequirements`、已校验 Tool Results、重规划任务 | `TripProposal` | 决定调用哪些 Tools，整合吃住行信息并生成或局部更新方案 |
-| 审批 / 审核总结 Agent | `TripProposal`、规则校验结果、原始需求 | `ReviewResult`、待确认方案 | 解释审核结论、整理风险与待确认项；不重新猜测用户需求或调用吃住行 Tools |
-
-吃住行能力不再拆分为多个 Agent，而是作为任务拆分规划 Agent 可调用的 Tools。日期、人数、预算、固定日程等硬约束由确定性 `RuleValidationService` 校验；用户确认属于工作流节点，不是 Agent。
-
-### 4.2 规划中的 LangGraph 工作流
-
-```mermaid
-flowchart TD
-    A["用户消息"] --> B["统一入口 / 需求分析 Agent"]
-    B --> C{"intent"}
-
-    C -- "chat" --> D["直接返回聊天回复"]
-
-    C -- "trip_planning" --> E["更新 TripRequirements"]
-    E --> F{"需求完整？"}
-    F -- "否" --> G["返回一个关键追问"]
-    G --> A
-
-    F -- "是" --> H["任务拆分规划 Agent"]
-    H --> I["生成 Tool Plan"]
-    I --> J["ToolExecutor: 校验、缓存、并行、超时"]
-    J --> K["吃 / 住 / 行 / 景点 / 天气 Tools"]
-    K --> H
-
-    H --> L["TripProposal 草案"]
-    L --> M["RuleValidationService"]
-    M --> N{"硬约束通过？"}
-
-    N -- "否且可重试" --> O["最小重规划任务"]
-    O --> H
-    N -- "否且超过上限" --> P["输出风险与待用户决策项"]
-
-    N -- "是" --> Q["审批 / 审核总结 Agent"]
-    Q --> R["待确认方案"]
-    R --> S{"用户确认？"}
-
-    S -- "修改" --> A
-    S -- "确认" --> T["生成 ConfirmedTripPlan"]
+```json
+{
+  "conversation_id": null,
+  "messages": [
+    {
+      "role": "user",
+      "content": "下个月从广州去北京玩一周，一共五个人"
+    }
+  ],
+  "short_term_memory": null,
+  "known_requirements": null,
+  "pending_plan": null
+}
 ```
 
-### 4.3 当前入口与后续子 Agent 协作
+前端实际使用时通常只提交当前用户消息，并回传上一轮返回的 `conversation_id` 和 `short_term_memory`。旧客户端仍可额外提交 `known_requirements` 和 `pending_plan`。
 
-当前 Demo 已实现统一入口 Agent 与规划 Agent。统一入口负责普通聊天与旅差规划意图分流、用户回复生成和 `TripRequirements` 提取；规划 Agent 只在需求完整时调用可信 Tools 并生成方案，不处理真实预订。
+### 9.3 响应示例
 
-```mermaid
-flowchart TD
-    A["用户消息与历史"] --> B["统一入口 Agent"]
-    B --> C{"intent"}
-    C -- "chat" --> D["返回普通聊天回复"]
-    C -- "trip_planning" --> E["提取结构化需求"]
-    E --> F{"核心条件完整？"}
-    F -- "否" --> G["返回单个澄清问题"]
-    F -- "是" --> H["LangGraph 进入规划 Agent"]
-    H --> I["地点、路线、POI 与天气 Tools"]
-    I --> J["返回旅差方案"]
+```json
+{
+  "conversation_id": "00000000-0000-4000-8000-000000000001",
+  "analysis": {
+    "intent": "trip_planning",
+    "reply": "请问您计划哪天出发？",
+    "requirements": {
+      "origin": "广州",
+      "destination": "北京",
+      "departure_date": null,
+      "return_date": null,
+      "trip_duration": {
+        "raw_text": "一周",
+        "amount": 1,
+        "unit": "week",
+        "is_approximate": false
+      },
+      "traveler_count": 5,
+      "budget": null,
+      "transport_preferences": [],
+      "accommodation_preferences": [],
+      "dining_preferences": [],
+      "attraction_preferences": [],
+      "general_preferences": [],
+      "fixed_schedule": []
+    },
+    "plan_action": "plan",
+    "pending_plan": null,
+    "confirmed_plan": null,
+    "missing_fields": ["departure_date"],
+    "is_complete": false
+  },
+  "short_term_memory": {
+    "summary": null,
+    "recent_messages": [
+      {
+        "role": "user",
+        "content": "下个月从广州去北京玩一周，一共五个人"
+      },
+      {
+        "role": "assistant",
+        "content": "请问您计划哪天出发？"
+      }
+    ]
+  }
+}
 ```
 
-目标工作流中，普通聊天在统一入口直接结束；只有完整的旅差需求会进入任务拆分规划 Agent。规划 Agent 仅通过白名单 Tools 查询吃住行信息，ToolExecutor 负责参数校验、缓存、并行、超时和失败降级。规则校验失败时，系统只把受影响的任务退回规划 Agent，且必须设置最大重规划次数；超过上限时返回风险与待用户决策项。
+实际字段以 `backend/app/schemas.py` 为准。业务异常统一由后端错误处理器返回，模型供应商全部不可用时错误码为 `LLM_FALLBACK_EXHAUSTED`。
 
-审核通过后，审批 / 审核总结 Agent 生成待确认方案。用户选择修改时，新的消息重新进入统一入口更新需求；用户确认后，工作流生成 `ConfirmedTripPlan`。外部数据不可用、价格或库存过期时，方案必须标记为待确认，不得伪装为已审核通过。
-
-### 4.4 共享状态原则
-
-- 使用 Pydantic 模型定义 LangGraph State，禁止依赖自由文本作为跨 Agent 的唯一数据格式。
-- 区分硬约束与软偏好：日期、固定会议和预算上限优先级最高。
-- 每个 Agent 只写入自己负责的状态字段，并保留来源、置信度和生成时间。
-- 审批 / 审核总结 Agent 不重新猜测用户意图，只读取规则校验结果并整理冲突、风险与待确认项。
-- 对外部 API 返回的时效数据记录查询时间与失效时间，避免使用过期价格做确认结论。
-
-## 5. 核心领域模型
-
-### 5.1 当前已实现契约
-
-```text
-ConversationAnalysis
-  - intent: chat | trip_planning
-  - reply
-  - requirements: TripRequirements | null
-  - missing_fields
-  - is_complete: bool | null
-
-TripRequirements
-  - origin / destination
-  - departure_date / return_date / trip_duration
-  - traveler_count / budget
-  - transport / accommodation / dining / attraction preferences
-  - fixed_schedule
-```
-
-### 5.2 后续规划状态（目标）
-
-```text
-TripRequirements
-  - traveler_profile
-  - origin
-  - destination_candidates
-  - departure_date / return_date
-  - travelers_count
-  - fixed_events
-  - transport_preferences
-  - hotel_preferences
-  - budget
-  - leisure_preferences
-  - missing_fields
-
-TripState
-  - requirements
-  - destination_decision
-  - transport_plan
-  - hotel_plan
-  - itinerary_plan
-  - budget_assessment
-  - validation_issues
-  - clarification_questions
-  - final_proposal
-```
-
-## 6. 项目文件结构
-
-### 6.1 当前已实现
+## 10. 项目结构
 
 ```text
 TripWeave/
 ├── README.md
+├── AGENT.md
 ├── .env.example
 ├── backend/
+│   ├── .env.example
 │   ├── requirements.txt
-│   └── app/
-│       ├── main.py
-│       ├── schemas.py
-│       ├── api/
-│       │   ├── exception/
-│       │   └── router/
-│       │       ├── chat.py
-│       │       └── health.py
-│       ├── agents/
-│       │   ├── conversation_entry_agent.py
-│       │   └── prompts/
-│       │       ├── global_system_prompt.md
-│       │       └── conversation_entry_prompt.md
-│       ├── core/
-│       │   ├── logging.py
-│       │   └── settings.py
-│       └── integrations/
-│           └── llm/
-│               ├── client.py
-│               ├── deepseek_client.py
-│               ├── openai_client.py
-│               ├── openai_compatible.py
-│               ├── proxy_client.py
-│               └── response_cleaner.py
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── schemas.py
+│   │   ├── api/
+│   │   │   ├── exception/
+│   │   │   └── router/
+│   │   │       ├── chat.py
+│   │   │       └── health.py
+│   │   ├── agents/
+│   │   │   ├── conversation_entry_agent.py
+│   │   │   ├── planning_agent.py
+│   │   │   ├── planning_evidence.py
+│   │   │   ├── review_agent.py
+│   │   │   ├── accommodation_search_agent.py
+│   │   │   ├── intercity_transport_search_agent.py
+│   │   │   ├── prompts/
+│   │   │   └── skills/
+│   │   │       └── trip-planning/
+│   │   ├── core/
+│   │   │   ├── settings.py
+│   │   │   ├── logging.py
+│   │   │   └── trip_duration.py
+│   │   ├── memory/
+│   │   │   └── short_term_memory.py
+│   │   ├── tools/
+│   │   │   ├── map_route_tool.py
+│   │   │   ├── poi_search.py
+│   │   │   ├── accommodation_tool.py
+│   │   │   ├── attraction_tool.py
+│   │   │   ├── food_tool.py
+│   │   │   ├── hotel_search_tool.py
+│   │   │   ├── traffic_search_tool.py
+│   │   │   ├── transport_tool.py
+│   │   │   └── weather_tool.py
+│   │   ├── services/
+│   │   │   ├── unsplash_service.py
+│   │   │   └── confirmed_trip_service.py
+│   │   ├── integrations/
+│   │   │   └── llm/
+│   │   ├── workflows/
+│   │   │   └── trip_conversation_graph.py
+│   │   └── logs/
+│   └── tests/
 └── frontend/
     ├── package.json
     └── src/
@@ -381,165 +503,55 @@ TripWeave/
         └── styles.css
 ```
 
-### 6.2 后续目标目录（未实现）
+`__pycache__`、测试缓存、前端 `node_modules` 和运行日志属于本地生成物，不是业务源代码。
 
-```text
-TripWeave/
-├── README.md
-├── .env.example
-├── pyproject.toml
-├── docker-compose.yml
-├── Makefile
-├── backend/
-│   ├── app/
-│   │   ├── main.py                     # FastAPI 应用入口
-│   │   ├── core/
-│   │   │   ├── settings.py             # 环境变量与应用配置
-│   │   │   └── logging.py              # 日志初始化配置
-│   │   ├── agents/
-│   │   │   └── prompts/
-│   │   │       └── global_system_prompt.py # 全局系统提示词
-│   │   ├── api/
-│   │   │   ├── exception/
-│   │   │   │   ├── exceptions.py       # 自定义异常类与错误响应结构
-│   │   │   │   └── exception_handlers.py # 统一异常处理函数
-│   │   │   └── router/
-│   │   │       ├── chat.py             # 对话接口与模型调用
-│   │   │       ├── trips.py            # 行程 CRUD、确认、重规划
-│   │   │       └── health.py            # 健康检查接口
-│   │   ├── agents/
-│   │   │   ├── graph.py                # LangGraph 图构建与路由
-│   │   │   ├── state.py                # 共享状态和 reducer
-│   │   │   ├── nodes/
-│   │   │   │   ├── intake.py
-│   │   │   │   ├── destination.py
-│   │   │   │   ├── transport.py
-│   │   │   │   ├── hotel.py
-│   │   │   │   ├── itinerary.py
-│   │   │   │   ├── budget.py
-│   │   │   │   └── review.py
-│   │   │   └── prompts/
-│   │   │       ├── intake.md
-│   │   │       ├── itinerary.md
-│   │   │       └── review.md
-│   │   ├── domain/
-│   │   │   ├── schemas/                # Pydantic 输入输出模型
-│   │   │   ├── services/               # 领域规则和方案组装
-│   │   │   └── repositories/           # 数据访问接口
-│   │   ├── integrations/
-│   │   │   ├── llm/
-│   │   │   │   ├── client.py           # 按 LLM_PROVIDER 分发调用
-│   │   │   │   ├── deepseek_client.py  # DeepSeek 模型调用客户端
-│   │   │   │   ├── openai_client.py    # OpenAI 模型调用客户端
-│   │   │   │   └── proxy_client.py     # 第三方中转站调用客户端
-│   │   │   ├── maps/                   # 地图、地理编码与路线工具
-│   │   │   ├── transport/              # 航班、铁路和本地交通工具
-│   │   │   └── hotels/                 # 酒店搜索与详情工具
-│   │   ├── db/
-│   │   │   ├── models/
-│   │   │   ├── session.py
-│   │   │   └── migrations/
-│   │   └── workers/                    # 异步刷新与长任务
-│   └── tests/
-│       ├── agents/
-│       ├── api/
-│       ├── domain/
-│       └── integrations/
-├── frontend/
-│   ├── src/
-│   │   ├── app/
-│   │   ├── features/
-│   │   │   ├── trip-chat/
-│   │   │   ├── itinerary/
-│   │   │   ├── hotel-selection/
-│   │   │   └── budget/
-│   │   ├── components/
-│   │   ├── lib/
-│   │   └── types/
-│   ├── public/
-│   └── package.json
-├── docs/
-│   ├── architecture.md
-│   ├── api-contract.md
-│   ├── prompt-guidelines.md
-│   └── adr/
-└── scripts/
-    ├── dev.ps1
-    ├── test.ps1
-    └── seed_demo_data.py
+## 11. 测试与验证
+
+后端测试使用 Python 标准库 `unittest`，从 `backend` 目录运行：
+
+```powershell
+cd backend
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-## 7. 当前 API
+也可以进行 Python 编译检查：
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `POST` | `/api/v1/chat/messages` | 发送完整浏览器会话，返回包含回复和结构化结果的 `analysis` |
-| `GET` | `/api/v1/health` | 服务健康检查 |
-
-`POST /api/v1/chat/messages` 请求示例：
-
-```json
-{
-  "messages": [
-    {"role": "user", "content": "下周去上海出差三天"}
-  ]
-}
+```powershell
+python -m compileall -q app tests
 ```
 
-响应示例：
+前端构建检查：
 
-```json
-{
-  "analysis": {
-    "intent": "trip_planning",
-    "reply": "请问您从哪里出发？",
-    "requirements": {
-      "origin": null,
-      "destination": "上海"
-    },
-    "missing_fields": ["departure_date", "trip_schedule", "traveler_count"],
-    "is_complete": false
-  }
-}
+```powershell
+cd frontend
+npm run build
 ```
 
-### 7.1 后续 API（未实现）
+测试目录用于覆盖入口 Agent、LangGraph 直接查询分支、短期记忆、规划 Agent、审核 Agent、日志与异常处理以及各类工具。当前工作区测试源码未完整保留，恢复测试文件后再执行上述完整测试命令。
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `POST` | `/api/v1/trips` | 创建旅行规划会话 |
-| `GET` | `/api/v1/trips/{trip_id}` | 获取当前旅行方案和规划状态 |
-| `PATCH` | `/api/v1/trips/{trip_id}/requirements` | 更新日期、预算等局部约束 |
-| `POST` | `/api/v1/trips/{trip_id}/replan` | 触发局部或完整重规划 |
-| `POST` | `/api/v1/trips/{trip_id}/confirm` | 确认交通、酒店和日程方案 |
+## 12. 当前边界与后续计划
 
-## 8. 数据与安全要求
+### 当前未实现
 
-- API Key、数据库连接和第三方密钥只能通过环境变量提供，不提交真实密钥。
-- 用户行程、联系人、会议地点等数据按用户隔离，并提供删除机制。
-- 对外部工具调用设置超时、重试与降级策略；失败时明确告知哪些信息未实时验证。
-- 将模型输出解析为结构化数据后再写库或展示，不直接信任自由文本。
-- 所有金额、时间和时区须记录来源；跨城市行程统一使用明确的本地时区。
+- 业务数据库、Redis、长期记忆和带身份认证的跨设备会话。
+- `/api/v1/trips` 计划 CRUD、重规划和确认接口。
+- 真实订单创建、支付、购票和订房。
+- 稳定的实时票价、库存和第三方预订 API。
+- Docker Compose、端到端浏览器测试和生产部署配置。
+- 模型原生自主 Tool Calls 循环。
 
-## 9. MVP 里程碑
+### 后续建议
 
-1. 完善 FastAPI、Pydantic 后端骨架，并实现模拟 Tools 与 `ToolExecutor`。
-2. 完成统一入口 / 需求分析 Agent、澄清问答和共享状态持久化。
-3. 完成任务拆分规划 Agent、吃住行 Tools、`RuleValidationService` 与审批 / 审核总结 Agent。
-4. 接入 LangGraph，编排重规划循环、用户确认暂停与恢复。
-5. 建立方案展示界面，接入首批真实地图、天气和酒店数据，并完善测试、可观测性与 Docker 部署。
+1. 先补充真实外部数据源的契约测试和观测指标。
+2. 再把当前浏览器快照和前端状态迁移到服务端会话存储。
+3. 增加独立的行程方案接口，降低聊天接口承载的状态复杂度。
+4. 在需求和工具契约稳定后，再评估是否需要把规划取证改造成模型原生 Tool Calls。
+5. 最后接入长期记忆、企业差旅规则、订单和审批系统。
 
-## 10. 首个可演示场景
+## 13. 安全与数据要求
 
-用户输入：
-
-> 我 9 月 12 日从杭州去北京出差，15 日返回。13 日上午在国贸开会，预算 6000 元，酒店要干净安静，晚上想吃北京菜。
-
-系统应完成：
-
-1. 识别日期、出发地、目的地、固定会议、预算和住宿偏好。
-2. 在缺少出发时间、人数等关键条件时进行追问或采用可解释默认值。
-3. 生成杭州至北京的往返交通候选。
-4. 推荐国贸周边符合预算的酒店并说明理由。
-5. 在会议安排之外生成合理的餐饮和可选活动。
-6. 给出交通、住宿与日常费用的预算汇总，并提示不确定价格需要实时确认。
+- API Key 和第三方密钥只能通过环境变量提供，禁止提交真实密钥。
+- 模型原始请求和响应调试日志默认关闭，开启后只在受控环境短时使用。
+- 工具调用必须设置超时、结果长度限制和失败降级。
+- 外部查询结果必须标注估算或快照性质，不能把候选 POI、价格、库存和余票伪装成已确认订单。
+- 模型输出必须先经过 JSON 清洗、Pydantic 契约校验和本地规则校验，再进入工作流或前端展示。

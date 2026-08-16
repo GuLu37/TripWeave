@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -23,9 +24,9 @@ class ClientChatMessage(BaseModel):
 
 
 class ShortTermMemory(BaseModel):
-    """浏览器与后端之间传递的短期记忆快照。"""
+    """浏览器与后端之间传递的本地上下文窗口。"""
 
-    # 摘要承载滑动窗口之外的历史事实，后续可替换为数据库记忆引用。
+    # summary 为旧客户端兼容字段，当前不再生成或传递模型摘要。
     summary: str | None = Field(default=None, max_length=4_000)
     recent_messages: list[ClientChatMessage] = Field(
         default_factory=list,
@@ -99,17 +100,61 @@ class TripPlanSnapshot(BaseModel):
     review_result: ReviewResult
 
 
+class TripImage(BaseModel):
+    """确认方案中的 Unsplash 图片。"""
+
+    category: Literal["attraction", "food"]
+    query: str = Field(min_length=1, max_length=200)
+    url: str = Field(min_length=1, max_length=2_000)
+    thumb_url: str | None = Field(default=None, max_length=2_000)
+    alt_text: str | None = Field(default=None, max_length=500)
+    photographer: str | None = Field(default=None, max_length=200)
+    source_url: str | None = Field(default=None, max_length=2_000)
+
+
+class TripRouteOption(BaseModel):
+    """确认方案中的单种高德路线方式。"""
+
+    mode: Literal["transit", "walking", "driving", "bicycling"]
+    mode_label: str
+    distance_text: str | None = None
+    duration_text: str | None = None
+
+
+class TripRoute(BaseModel):
+    """确认方案中的一段本地路线。"""
+
+    category: Literal["attraction", "food"]
+    origin: str
+    destination: str
+    options: list[TripRouteOption] = Field(default_factory=list, max_length=8)
+    unavailable_modes: list[str] = Field(default_factory=list, max_length=8)
+
+
+class ConfirmedTripDetails(BaseModel):
+    """用户确认后供前端展示的图片和路线附加数据。"""
+
+    images: list[TripImage] = Field(default_factory=list, max_length=12)
+    routes: list[TripRoute] = Field(default_factory=list, max_length=6)
+    tool_status: dict[str, Literal["available", "unavailable", "skipped"]] = Field(
+        default_factory=dict,
+    )
+
+
 class ConfirmedTripPlan(TripPlanSnapshot):
-    """用户确认后的行程方案结果，后续可直接映射到长期存储。"""
+    """用户确认后的完整行程方案结果。"""
 
     confirmed_at: datetime
+    details: ConfirmedTripDetails = Field(default_factory=ConfirmedTripDetails)
 
 
 class ChatRequest(BaseModel):
     """聊天接口接收的请求。"""
 
+    # 首轮为空时由后端创建；后续请求必须回传同一个 ID 以恢复 LangGraph 状态。
+    conversation_id: UUID | None = None
     messages: list[ClientChatMessage] = Field(min_length=1, max_length=40)
-    # 短期记忆由前端回传，后端每轮合并并返回更新后的快照。
+    # 本地上下文窗口由前端回传，后端每轮只保留最近消息。
     short_term_memory: ShortTermMemory | None = None
     # 浏览器保存的上轮已确认需求，用于在截短历史后维持旅差上下文。
     known_requirements: TripRequirements | None = None
@@ -134,6 +179,8 @@ class ConversationAnalysis(BaseModel):
     pending_plan: TripPlanSnapshot | None = None
     # 用户确认成功后写入，后续接入数据库时可作为持久化载荷。
     confirmed_plan: ConfirmedTripPlan | None = None
+    # 浏览器查询的原始结构化结果；reply 只负责口语化展示，不再承担解析职责。
+    search_results: dict[str, dict[str, object]] = Field(default_factory=dict)
     # 以下两项由入口 Agent 根据 requirements 的本地规则计算，不依赖模型判断。
     missing_fields: list[str] = Field(default_factory=list)
     is_complete: bool | None = None
@@ -162,7 +209,9 @@ class ConversationAnalysis(BaseModel):
 class ChatResponse(BaseModel):
     """聊天接口返回的统一入口分析结果。"""
 
+    # 对外暴露会话 ID，前端和其他客户端用它关联服务端检查点。
+    conversation_id: UUID
     # analysis.reply 同时是前端展示的助手回复和后续工作流的唯一回复来源。
     analysis: ConversationAnalysis
-    # 返回更新后的短期记忆，前端下一轮只需提交当前消息与该快照。
+    # 返回更新后的本地上下文窗口，兼容现有前端请求流程。
     short_term_memory: ShortTermMemory

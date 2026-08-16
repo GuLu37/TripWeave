@@ -20,6 +20,10 @@ from app.api.router.health import router as health_router
 from app.api.exception.exception_handlers import register_exception_handlers
 from app.core.logging import LOG_DIR, setup_logging
 from app.core.settings import get_settings
+from app.workflows.trip_conversation_graph import (
+    close_trip_conversation_graph,
+    initialize_trip_conversation_graph,
+)
 
 APP_VERSION = "0.1.0"
 # 启动阶段读取一次全局配置，供 CORS 等应用级能力复用。
@@ -33,9 +37,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # 使用生命周期而非模块顶层初始化，避免热重载父子进程重复创建日志处理器。
     setup_logging()
+    # 第二步：打开 SQLite Checkpointer，确保服务重启后可按 conversation_id 恢复图状态。
+    await initialize_trip_conversation_graph()
     logger.info("TripWeave API 已启动：version=%s", app.version)
     yield
-    # 预留关闭阶段入口，后续可在此释放数据库、Redis 或模型客户端资源。
+    # 第三步：服务停止时关闭检查点连接，避免 SQLite 文件句柄泄漏。
+    await close_trip_conversation_graph()
     logger.info("TripWeave API 正在停止。")
 
 
