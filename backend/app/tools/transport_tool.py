@@ -13,9 +13,9 @@ from app.api.exception.error_handler import record_error
 from app.tools.map_route_tool import AmapMapRouteTool, RouteMode
 
 _DEFAULT_MODES: tuple[RouteMode, ...] = (
+    "driving",
     "transit",
     "walking",
-    "driving",
     "bicycling",
 )
 logger = logging.getLogger(__name__)

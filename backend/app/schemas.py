@@ -92,26 +92,6 @@ class ReviewResult(BaseModel):
     pending_items: list[str] = Field(default_factory=list, max_length=20)
 
 
-class TripPlanSnapshot(BaseModel):
-    """浏览器在待确认阶段保存并回传的完整方案快照。"""
-
-    requirements: TripRequirements
-    proposal: str = Field(min_length=1, max_length=20_000)
-    review_result: ReviewResult
-
-
-class TripImage(BaseModel):
-    """确认方案中的 Unsplash 图片。"""
-
-    category: Literal["attraction", "food"]
-    query: str = Field(min_length=1, max_length=200)
-    url: str = Field(min_length=1, max_length=2_000)
-    thumb_url: str | None = Field(default=None, max_length=2_000)
-    alt_text: str | None = Field(default=None, max_length=500)
-    photographer: str | None = Field(default=None, max_length=200)
-    source_url: str | None = Field(default=None, max_length=2_000)
-
-
 class TripRouteOption(BaseModel):
     """确认方案中的单种高德路线方式。"""
 
@@ -119,6 +99,32 @@ class TripRouteOption(BaseModel):
     mode_label: str
     distance_text: str | None = None
     duration_text: str | None = None
+    navigation_url: str | None = Field(default=None, max_length=2_000)
+
+
+class TripOverviewRoute(BaseModel):
+    """确认方案中的出发地到目的地高德距离摘要。"""
+
+    origin: str
+    destination: str
+    origin_longitude: float | None = None
+    origin_latitude: float | None = None
+    destination_longitude: float | None = None
+    destination_latitude: float | None = None
+    distance_text: str | None = None
+    duration_text: str | None = None
+    navigation_url: str | None = Field(default=None, max_length=2_000)
+
+
+class TripMapPoint(BaseModel):
+    """确认方案实时地图中的一个地点标记。"""
+
+    category: Literal["attraction", "food"]
+    name: str
+    address: str | None = Field(default=None, max_length=500)
+    longitude: float
+    latitude: float
+    sequence: int = Field(ge=1, le=20)
 
 
 class TripRoute(BaseModel):
@@ -132,13 +138,25 @@ class TripRoute(BaseModel):
 
 
 class ConfirmedTripDetails(BaseModel):
-    """用户确认后供前端展示的图片和路线附加数据。"""
+    """方案供前端展示的图片和路线附加数据。"""
 
-    images: list[TripImage] = Field(default_factory=list, max_length=12)
-    routes: list[TripRoute] = Field(default_factory=list, max_length=6)
+    overview_route: TripOverviewRoute | None = None
+    map_points: list[TripMapPoint] = Field(default_factory=list, max_length=12)
+    # 12 个路线点最多形成 11 段相邻城市内路线。
+    routes: list[TripRoute] = Field(default_factory=list, max_length=11)
+    weather: dict[str, object] = Field(default_factory=dict)
     tool_status: dict[str, Literal["available", "unavailable", "skipped"]] = Field(
         default_factory=dict,
     )
+
+
+class TripPlanSnapshot(BaseModel):
+    """浏览器在待确认阶段保存并回传的完整方案快照。"""
+
+    requirements: TripRequirements
+    proposal: str = Field(min_length=1, max_length=20_000)
+    review_result: ReviewResult
+    details: ConfirmedTripDetails = Field(default_factory=ConfirmedTripDetails)
 
 
 class ConfirmedTripPlan(TripPlanSnapshot):
@@ -153,6 +171,8 @@ class ChatRequest(BaseModel):
 
     # 首轮为空时由后端创建；后续请求必须回传同一个 ID 以恢复 LangGraph 状态。
     conversation_id: UUID | None = None
+    # 每次浏览器发送消息时生成，用于关联本轮真实工作流进度。
+    client_request_id: UUID | None = None
     messages: list[ClientChatMessage] = Field(min_length=1, max_length=40)
     # 本地上下文窗口由前端回传，后端每轮只保留最近消息。
     short_term_memory: ShortTermMemory | None = None
@@ -160,6 +180,27 @@ class ChatRequest(BaseModel):
     known_requirements: TripRequirements | None = None
     # 浏览器保存待确认方案，用于下一轮识别确认、修改并向规划 Agent 提供重规划上下文。
     pending_plan: TripPlanSnapshot | None = None
+
+
+class ChatProgressEvent(BaseModel):
+    """前端展示的一条安全执行进度。"""
+
+    id: str
+    sequence: int
+    agent: str
+    action: str
+    tool: str | None = None
+    parent_id: str | None = None
+    status: Literal["running", "completed", "failed", "unavailable", "rejected"]
+    reason: str | None = None
+
+
+class ChatProgressResponse(BaseModel):
+    """当前浏览器请求的工作流进度快照。"""
+
+    found: bool
+    is_complete: bool
+    events: list[ChatProgressEvent] = Field(default_factory=list)
 
 
 class ConversationAnalysis(BaseModel):
@@ -215,3 +256,5 @@ class ChatResponse(BaseModel):
     analysis: ConversationAnalysis
     # 返回更新后的本地上下文窗口，兼容现有前端请求流程。
     short_term_memory: ShortTermMemory
+    # 返回本轮已完成的真实进度快照，避免客户端轮询在收口时读到旧状态。
+    progress_events: list[ChatProgressEvent] = Field(default_factory=list)

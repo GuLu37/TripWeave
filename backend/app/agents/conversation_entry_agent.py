@@ -16,6 +16,7 @@ from app.integrations.llm.response_cleaner import extract_json_response
 from app.schemas import (
     ClientChatMessage,
     ConversationAnalysis,
+    TripDuration,
     TripPlanSnapshot,
     TripRequirements,
 )
@@ -50,7 +51,12 @@ _WEEKDAY_VALUES = {
     "天": 6,
 }
 _RELATIVE_WEEKDAY_PATTERN = re.compile(
-    r"^(?P<week>本周|这周|下周)(?:周|星期)?(?P<weekday>[一二三四五六日天])$"
+    r"^(?:(?P<week>本周|这周|下周)(?:周|星期)?|(?:周|星期))"
+    r"(?P<weekday>[一二三四五六日天])$"
+)
+_VAGUE_DATE_PATTERN = re.compile(
+    r"(?:本周|这周|下周)(?![周星期]?[一二三四五六日天])|"
+    r"(?:本月|这个月|下个月|近期|最近|月初|月底|上旬|中旬|下旬)"
 )
 _CHINESE_FULL_DATE_PATTERN = re.compile(
     r"^(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日?$"
@@ -105,19 +111,6 @@ async def analyze_intent(
 
     # 第一步：意图节点读取近期消息和窗口外的少量历史，结构化快照继续作为稳定记忆。
     context_messages = _build_agent_context(messages)
-    latest_user_text = _get_latest_user_text(messages)
-    rule_decision = _resolve_intent_with_rules(
-        messages,
-        known_requirements=known_requirements,
-        pending_plan=pending_plan,
-    )
-    if _can_resolve_intent_locally(latest_user_text, rule_decision):
-        logger.info(
-            "意图判断使用本地规则：intent=%s context_message_count=%s",
-            rule_decision.intent,
-            len(context_messages),
-        )
-        return rule_decision
     try:
         response_text = await chat_with_llm(
             context_messages,
@@ -133,14 +126,7 @@ async def analyze_intent(
             caller_name="conversation_intent_agent",
         )
         model_decision = _parse_intent_payload(response_text)
-        if model_decision.intent != "uncertain":
-            # 第二步：模型给出明确意图后，仍用确定性规则保护连续旅差补充信息。
-            return _correct_intent_with_active_trip_context(
-                model_decision,
-                context_messages,
-                known_requirements=known_requirements,
-                pending_plan=pending_plan,
-            )
+        return model_decision
     except AppException as error:
         record_error(
             error,
@@ -220,8 +206,10 @@ async def analyze_requirements(
         requirements = _repair_missing_requirements(
             known_requirements or TripRequirements(),
             messages,
+            overwrite_existing=True,
         )
         requirements = _normalize_trip_dates(requirements)
+        requirements = _clear_vague_departure_date(requirements, messages)
         missing_fields = _get_missing_fields(requirements)
         return ConversationAnalysis(
             intent="trip_planning",
@@ -243,6 +231,7 @@ async def analyze_requirements(
     )
     requirements = _repair_missing_requirements(requirements, messages)
     requirements = _normalize_trip_dates(requirements)
+    requirements = _clear_vague_departure_date(requirements, messages)
     plan_action = _resolve_plan_action(intent.plan_action, pending_plan)
     missing_fields = _get_missing_fields(requirements)
     # 第三步：完整性只由本地规则决定，模型回复不能绕过缺失字段追问。
@@ -302,8 +291,10 @@ async def analyze_search_requirements(
         requirements = _repair_search_requirements(
             known_requirements or TripRequirements(),
             messages,
+            overwrite_existing=True,
         )
         requirements = _normalize_trip_dates(requirements)
+        requirements = _clear_vague_departure_date(requirements, messages)
         missing_fields = _get_search_missing_fields(intent.intent, requirements)
         return ConversationAnalysis(
             intent=intent.intent,
@@ -321,6 +312,7 @@ async def analyze_search_requirements(
     requirements = _merge_requirements(known_requirements, payload.requirements)
     requirements = _repair_search_requirements(requirements, messages)
     requirements = _normalize_trip_dates(requirements)
+    requirements = _clear_vague_departure_date(requirements, messages)
     missing_fields = _get_search_missing_fields(intent.intent, requirements)
     reply = (
         _build_search_follow_up_reply(intent.intent, missing_fields)
@@ -336,41 +328,6 @@ async def analyze_search_requirements(
             "missing_fields": missing_fields,
             "is_complete": not missing_fields,
         }
-    )
-
-
-async def analyze_conversation(
-    messages: list[ClientChatMessage],
-    *,
-    known_requirements: TripRequirements | None = None,
-    pending_plan: TripPlanSnapshot | None = None,
-) -> ConversationAnalysis:
-    """兼容旧调用方，按意图节点和需求节点顺序完成入口分析。"""
-
-    # 第一步：先完成意图判断，普通聊天不进入需求分析节点。
-    intent = await analyze_intent(
-        messages,
-        known_requirements=known_requirements,
-        pending_plan=pending_plan,
-    )
-    if intent.intent == "chat":
-        return ConversationAnalysis(intent="chat", reply=intent.reply)
-    if intent.intent in {
-        "accommodation_search",
-        "intercity_transport_search",
-    }:
-        return await analyze_search_requirements(
-            messages,
-            intent=intent,
-            known_requirements=known_requirements,
-            pending_plan=pending_plan,
-        )
-    # 第二步：旅差意图进入独立需求分析，保证后续流程按状态机顺序执行。
-    return await analyze_requirements(
-        messages,
-        intent=intent,
-        known_requirements=known_requirements,
-        pending_plan=pending_plan,
     )
 
 
@@ -406,6 +363,7 @@ def _build_search_system_prompt(
 
     prompt_parts = [
         load_prompt("search_requirement_prompt.md"),
+        _build_current_date_instruction(),
         f"当前查询类型：{intent}",
     ]
     if known_requirements is not None:
@@ -462,43 +420,6 @@ _INTENT_RULE_PATTERNS = {
 }
 
 
-def _correct_intent_with_active_trip_context(
-    decision: IntentDecision,
-    messages: list[ClientChatMessage],
-    *,
-    known_requirements: TripRequirements | None,
-    pending_plan: TripPlanSnapshot | None,
-) -> IntentDecision:
-    """防止模型把连续旅差会话中的确定性补充信息误判为聊天。"""
-
-    # 第一步：只有存在历史需求且当前消息包含明确字段时才纠偏，避免普通问候被强行拉进行程流程。
-    if decision.intent != "chat":
-        return decision
-    if known_requirements is None and pending_plan is None:
-        return decision
-    latest_user_text = next(
-        (
-            message.content.strip()
-            for message in reversed(messages)
-            if message.role == "user"
-        ),
-        "",
-    )
-    if not _has_trip_requirement_detail(latest_user_text):
-        return decision
-    logger.info(
-        "意图规则纠偏：model_intent=chat corrected_intent=trip_planning "
-        "has_active_trip=%s latest_message_chars=%s",
-        known_requirements is not None or pending_plan is not None,
-        len(latest_user_text),
-    )
-    return IntentDecision(
-        intent="trip_planning",
-        plan_action="modify" if pending_plan is not None else "plan",
-        reply="开始分析您补充的行程信息。",
-    )
-
-
 def _build_agent_context(
     messages: list[ClientChatMessage],
 ) -> list[ClientChatMessage]:
@@ -538,47 +459,6 @@ def _get_latest_user_text(messages: list[ClientChatMessage]) -> str:
     )
 
 
-def _can_resolve_intent_locally(
-    latest_user_text: str,
-    decision: IntentDecision,
-) -> bool:
-    """判断当前意图是否足够确定，可以省略一次入口 LLM 调用。"""
-
-    tags = _scan_intent_tags(latest_user_text)
-    name_update = _extract_name_from_text(latest_user_text)
-    if (
-        "greeting" in tags
-        or (
-            name_update
-            and not _has_trip_requirement_detail(latest_user_text)
-        )
-        or (
-            _NAME_MEMORY_QUESTION_PATTERN.search(latest_user_text)
-            and not _has_trip_requirement_detail(latest_user_text)
-        )
-    ):
-        return True
-    if decision.intent in {
-        "accommodation_search",
-        "intercity_transport_search",
-    }:
-        return True
-    return decision.intent == "trip_planning" and (
-        (
-            "trip_detail" in tags
-            and bool(
-                _DATE_EXPRESSION_PATTERN.search(latest_user_text)
-                or _extract_traveler_count(latest_user_text) is not None
-                or _extract_trip_duration(latest_user_text) is not None
-                or "从" in latest_user_text
-            )
-        )
-        or bool(re.search(r"(?:规划|安排|出差|旅行|旅游|行程)", latest_user_text))
-        or "modify" in tags
-        or "confirm" in tags
-    )
-
-
 def _has_trip_requirement_detail(text: str) -> bool:
     """判断当前消息是否包含可并入旅差需求的确定性字段。"""
 
@@ -614,9 +494,7 @@ def _resolve_intent_with_rules(
     is_modify = "modify" in tags
     is_confirm = "confirm" in tags and not is_modify
     name_update = _extract_name_from_text(latest_user_text)
-    is_name_memory_question = bool(
-        _NAME_MEMORY_QUESTION_PATTERN.search(latest_user_text)
-    )
+    is_name_memory_question = _has_name_memory_question(latest_user_text)
 
     # 第二步：姓名记忆是确定性的个人闲聊，不需要交给意图模型猜测；
     # 夹带明确行程信息时仍交给旅差意图和需求分析流程处理。
@@ -639,7 +517,7 @@ def _resolve_intent_with_rules(
         return IntentDecision(
             intent="chat",
             plan_action=None,
-            reply=_build_chat_reply(latest_user_text, messages),
+            reply="单独天气查询不会启动完整行程规划；请在行程方案中查看天气参考，或补充目的地和日期让我纳入规划。",
         )
 
     # 第四步：独立查询优先进入专用查询分支，但明确修改方案仍属于旅差规划。
@@ -728,15 +606,32 @@ def _extract_name_from_text(text: str) -> str | None:
     return name or None
 
 
-def _get_known_user_name(messages: list[ClientChatMessage]) -> str | None:
-    """按时间顺序读取最近一次用户指定的称呼。"""
+def _has_name_memory_question(text: str) -> bool:
+    """判断用户是否在询问当前或最初设定的称呼。"""
 
-    name: str | None = None
+    return bool(
+        _NAME_MEMORY_QUESTION_PATTERN.search(text)
+        or _INITIAL_NAME_MEMORY_PATTERN.search(text)
+    )
+
+
+def _asks_initial_user_name(text: str) -> bool:
+    """判断用户是否明确询问第一次设定的称呼。"""
+
+    return bool(_INITIAL_NAME_MEMORY_PATTERN.search(text))
+
+
+def _get_user_names(messages: list[ClientChatMessage]) -> list[str]:
+    """按时间顺序读取用户主动设定过的称呼。"""
+
+    names: list[str] = []
     for message in messages:
         if message.role != "user":
             continue
-        name = _extract_name_from_text(message.content) or name
-    return name
+        name = _extract_name_from_text(message.content)
+        if name and (not names or name != names[-1]):
+            names.append(name)
+    return names
 
 
 def _build_chat_reply(
@@ -747,8 +642,15 @@ def _build_chat_reply(
 ) -> str:
     """生成不暴露内部路由状态的轻量闲聊回复。"""
 
-    known_name = name_update or _get_known_user_name(messages)
-    if _NAME_MEMORY_QUESTION_PATTERN.search(latest_user_text):
+    configured_names = _get_user_names(messages)
+    known_name = name_update or (configured_names[-1] if configured_names else None)
+    if _has_name_memory_question(latest_user_text):
+        if _asks_initial_user_name(latest_user_text):
+            initial_name = configured_names[0] if configured_names else None
+            if initial_name and known_name and initial_name != known_name:
+                return f"最开始你让我叫你{initial_name}，后来改成了{known_name}。"
+            if initial_name:
+                return f"最开始你让我叫你{initial_name}。"
         return (
             f"当然记得，你希望我叫你{known_name}。"
             if known_name
@@ -775,7 +677,7 @@ def _build_conversation_system_prompt(
 
     # 第一步：固定指令定义意图边界和结构化输出契约。
     prompt = load_prompt("conversation_entry_prompt.md")
-    prompt_parts = [prompt]
+    prompt_parts = [prompt, _build_current_date_instruction()]
     if known_requirements is not None:
         # 第二步：仅注入已确认字段，且明确当前消息优先于历史快照。
         snapshot = known_requirements.model_dump(
@@ -805,6 +707,19 @@ def _build_conversation_system_prompt(
             f"{json.dumps(pending_context, ensure_ascii=False, separators=(',', ':'))}"
         )
     return "\n\n".join(prompt_parts)
+
+
+def _build_current_date_instruction() -> str:
+    """向 LLM 提供相对日期解释所需的唯一日期锚点。"""
+
+    reference_date = date.today()
+    weekday = "一二三四五六日"[reference_date.weekday()]
+    return (
+        f"当前日期是 {reference_date.isoformat()}（周{weekday}）。"
+        "遇到可明确落到自然日的相对日期时，必须按此日期理解并输出 ISO 日期（YYYY-MM-DD）；"
+        "例如“周三”表示即将到来的周三，“下周三”表示下一自然周的周三。"
+        "只有“下周”“下个月”等无法确定具体哪一天的范围表达，才不要填写日期字段。"
+    )
 
 
 def _resolve_plan_action(
@@ -893,15 +808,41 @@ def _merge_requirements(
         ).items()
         if value is not None
     }
+    destination_changed = (
+        isinstance(updates.get("destination"), str)
+        and not _same_destination(
+            known_requirements.destination,
+            updates["destination"],
+        )
+    )
     # 第三步：嵌套模型经 model_dump 后会变为字典，必须重新校验以恢复 TripDuration 等字段类型。
     merged_data = known_requirements.model_dump()
+    if destination_changed:
+        # 旧城市的地点偏好和固定日程不能用于新目的地，否则会让 POI 工具用
+        # “广州景点”等历史关键词去检索乌鲁木齐或南昌，最终得到空候选。
+        for field_name in (
+            "accommodation_preferences",
+            "dining_preferences",
+            "attraction_preferences",
+            "fixed_schedule",
+        ):
+            merged_data[field_name] = []
     merged_data.update(updates)
     return TripRequirements.model_validate(merged_data)
 
 
+def _same_destination(first: str | None, second: str) -> bool:
+    """比较目的地文本，避免“广州”与“广州市”被视为不同城市。"""
+
+    if first is None:
+        return False
+    normalize = lambda value: re.sub(r"(?:市|地区|盟)$", "", re.sub(r"\s+", "", value))
+    return normalize(first) == normalize(second)
+
+
 _DATE_EXPRESSION_PATTERN = re.compile(
     r"(今天|明天|后天|"
-    r"(?:本周|这周|下周)(?:周|星期)?[一二三四五六日天]|"
+    r"(?:(?:本周|这周|下周)(?:周|星期)?|(?:周|星期))[一二三四五六日天]|"
     r"\d{4}年\d{1,2}月\d{1,2}日?|"
     r"\d{1,2}月\d{1,2}日?|"
     r"\d{1,2}[./-]\d{1,2})"
@@ -920,6 +861,12 @@ _NAME_UPDATE_PATTERN = re.compile(
 )
 _NAME_MEMORY_QUESTION_PATTERN = re.compile(
     r"(?:记得|还记得|知道).{0,8}(?:我叫什么|我的名字|怎么称呼我)"
+)
+_INITIAL_NAME_MEMORY_PATTERN = re.compile(
+    r"(?:"
+    r"(?:最初|最开始|一开始|起初).{0,12}(?:叫(?:我)?|称呼(?:我)?|让你叫(?:我)?|名字)"
+    r"|我.{0,8}(?:最初|最开始|一开始|起初).{0,10}(?:叫(?:我)?|称呼(?:我)?|让你叫(?:我)?|名字)"
+    r")"
 )
 _ORIGIN_PATTERN = re.compile(
     r"从(?P<origin>[\u4e00-\u9fffA-Za-z·]{2,30}?)(?="
@@ -945,6 +892,8 @@ _DESTINATION_PATTERN = re.compile(
 def _repair_missing_requirements(
     requirements: TripRequirements,
     messages: list[ClientChatMessage],
+    *,
+    overwrite_existing: bool = False,
 ) -> TripRequirements:
     """从近期用户原话补回模型遗漏的确定性需求字段。"""
 
@@ -955,26 +904,35 @@ def _repair_missing_requirements(
         if message.role == "user"
     )
     updates: dict[str, object] = {}
-    # 第二步：当前用户明确修改日期、人数或路线时覆盖旧快照，避免继续使用第一次方案。
+    # 第二步：模型成功时只补回遗漏字段；只有模型不可用时才允许规则覆盖旧快照。
     candidates = _DATE_EXPRESSION_PATTERN.findall(user_text)
     for candidate in reversed(candidates):
         normalized_date = _normalize_trip_date(candidate, date.today())
-        if normalized_date is not None:
+        if normalized_date is not None and (
+            overwrite_existing or requirements.departure_date is None
+        ):
             updates["departure_date"] = normalized_date
             break
     traveler_count = _extract_traveler_count(user_text)
-    if traveler_count is not None:
+    if traveler_count is not None and (
+        overwrite_existing or requirements.traveler_count is None
+    ):
         updates["traveler_count"] = traveler_count
     trip_duration = _extract_trip_duration(user_text)
-    if trip_duration is not None:
+    if trip_duration is not None and (
+        overwrite_existing or requirements.trip_duration is None
+    ):
         updates["trip_duration"] = trip_duration
+    elif _duration_came_from_date_expression(user_text, requirements.trip_duration):
+        updates["trip_duration"] = None
     origin_match = _ORIGIN_PATTERN.search(user_text)
-    if origin_match is not None:
+    if origin_match is not None and (
+        overwrite_existing or requirements.origin is None
+    ):
         updates["origin"] = origin_match["origin"]
     destination_match = _DESTINATION_PATTERN.search(user_text)
     if destination_match is not None and (
-        not requirements.destination
-        or destination_match["destination"] != requirements.destination
+        overwrite_existing or requirements.destination is None
     ):
         updates["destination"] = destination_match["destination"]
     if not updates:
@@ -988,6 +946,8 @@ def _repair_missing_requirements(
 def _repair_search_requirements(
     requirements: TripRequirements,
     messages: list[ClientChatMessage],
+    *,
+    overwrite_existing: bool = False,
 ) -> TripRequirements:
     """从查询原话补回路线、目的地和住宿晚数等确定性字段。"""
 
@@ -998,32 +958,61 @@ def _repair_search_requirements(
     )
     updates: dict[str, object] = {}
     route_match = _ROUTE_PATTERN.search(user_text)
-    if route_match is not None:
+    if route_match is not None and (
+        overwrite_existing or requirements.origin is None
+    ):
         updates["origin"] = route_match["origin"]
+    if route_match is not None and (
+        overwrite_existing or requirements.destination is None
+    ):
         updates["destination"] = route_match["destination"]
     origin_match = _ORIGIN_PATTERN.search(user_text)
-    if origin_match is not None:
+    if origin_match is not None and (
+        overwrite_existing or requirements.origin is None
+    ):
         updates["origin"] = origin_match["origin"]
     destination_match = _DESTINATION_PATTERN.search(user_text)
-    if destination_match is not None:
+    if destination_match is not None and (
+        overwrite_existing or requirements.destination is None
+    ):
         updates["destination"] = destination_match["destination"]
     candidates = _DATE_EXPRESSION_PATTERN.findall(user_text)
     for candidate in reversed(candidates):
         normalized_date = _normalize_trip_date(candidate, date.today())
-        if normalized_date is not None:
+        if normalized_date is not None and (
+            overwrite_existing or requirements.departure_date is None
+        ):
             updates["departure_date"] = normalized_date
             break
     trip_duration = _extract_trip_duration(user_text)
-    if trip_duration is not None:
+    if trip_duration is not None and (
+        overwrite_existing or requirements.trip_duration is None
+    ):
         updates["trip_duration"] = trip_duration
+    elif _duration_came_from_date_expression(user_text, requirements.trip_duration):
+        updates["trip_duration"] = None
     traveler_count = _extract_traveler_count(user_text)
-    if traveler_count is not None:
+    if traveler_count is not None and (
+        overwrite_existing or requirements.traveler_count is None
+    ):
         updates["traveler_count"] = traveler_count
     if not updates:
         return requirements
     repaired_data = requirements.model_dump()
     repaired_data.update(updates)
     return TripRequirements.model_validate(repaired_data)
+
+
+def _clear_vague_departure_date(
+    requirements: TripRequirements,
+    messages: list[ClientChatMessage],
+) -> TripRequirements:
+    """本轮只给出范围日期时，清空模型可能补造的具体出发日。"""
+
+    latest_user_text = _get_latest_user_text(messages)
+    if not _has_vague_date_without_specific_date(latest_user_text):
+        return requirements
+    return requirements.model_copy(update={"departure_date": None})
 
 
 def _get_search_missing_fields(
@@ -1036,15 +1025,30 @@ def _get_search_missing_fields(
         missing_fields = [
             field_name
             for field_name in ("destination", "departure_date", "traveler_count")
-            if not getattr(requirements, field_name)
+            if (
+                not getattr(requirements, field_name)
+                or (
+                    field_name == "departure_date"
+                    and not _has_specific_date(requirements.departure_date)
+                )
+            )
         ]
-        if not requirements.return_date and not requirements.trip_duration:
+        if (
+            (not requirements.return_date or not _has_specific_date(requirements.return_date))
+            and not requirements.trip_duration
+        ):
             missing_fields.insert(2, "trip_schedule")
         return missing_fields
     return [
         field_name
         for field_name in ("origin", "destination", "departure_date")
-        if not getattr(requirements, field_name)
+        if (
+            not getattr(requirements, field_name)
+            or (
+                field_name == "departure_date"
+                and not _has_specific_date(requirements.departure_date)
+            )
+        )
     ]
 
 
@@ -1096,7 +1100,16 @@ def _extract_trip_duration(text: str) -> object | None:
     matches = list(_DURATION_PATTERN.finditer(text))
     if not matches:
         return None
-    match = matches[-1]
+    match = next(
+        (
+            candidate
+            for candidate in reversed(matches)
+            if not _duration_match_inside_date(text, candidate)
+        ),
+        None,
+    )
+    if match is None:
+        return None
     amount_text = match["amount"]
     try:
         amount = float(amount_text)
@@ -1123,6 +1136,31 @@ def _extract_trip_duration(text: str) -> object | None:
         "unit": unit,
         "is_approximate": False,
     }
+
+
+def _duration_match_inside_date(text: str, match: re.Match[str]) -> bool:
+    """判断一个“数字+日/月”等片段是否只是日期的一部分。"""
+
+    return any(
+        date_match.start() <= match.start() and match.end() <= date_match.end()
+        for date_match in _DATE_EXPRESSION_PATTERN.finditer(text)
+    )
+
+
+def _duration_came_from_date_expression(
+    text: str,
+    duration: object,
+) -> bool:
+    """清理模型把具体日期中的“17日”误写成旅行时长的情况。"""
+
+    raw_text: object = None
+    if isinstance(duration, TripDuration):
+        raw_text = duration.raw_text
+    elif isinstance(duration, dict):
+        raw_text = duration.get("raw_text")
+    if not isinstance(raw_text, str) or not raw_text:
+        return False
+    return any(raw_text in date_match.group(0) for date_match in _DATE_EXPRESSION_PATTERN.finditer(text))
 
 
 def _parse_chinese_integer(value: str) -> int | None:
@@ -1205,15 +1243,17 @@ def _normalize_trip_date(
     relative_offset = _RELATIVE_DAY_OFFSETS.get(normalized_value)
     if relative_offset is not None:
         return (reference_date + timedelta(days=relative_offset)).isoformat()
-    # 第三步：本周、这周和下周的星期表达按周一至周日的固定日历语义计算。
+    # 第三步：星期表达按周一至周日的日历语义计算；不带周前缀时取即将到来的该工作日。
     relative_weekday = _RELATIVE_WEEKDAY_PATTERN.fullmatch(normalized_value)
     if relative_weekday is not None:
         weekday = _WEEKDAY_VALUES[relative_weekday["weekday"]]
         days_until_weekday = weekday - reference_date.weekday()
         if relative_weekday["week"] == "下周":
             days_until_weekday += 7
-        elif days_until_weekday < 0:
+        elif relative_weekday["week"] in {"本周", "这周"} and days_until_weekday < 0:
             return None
+        elif relative_weekday["week"] is None and days_until_weekday < 0:
+            days_until_weekday += 7
         return (reference_date + timedelta(days=days_until_weekday)).isoformat()
     # 第四步：完整中文年月日可无歧义转换；仅月日只有落在当前或未来时才补当前年份。
     full_date = _CHINESE_FULL_DATE_PATTERN.fullmatch(normalized_value)
@@ -1248,6 +1288,23 @@ def _normalize_trip_date(
     return None
 
 
+def _has_specific_date(value: str | None) -> bool:
+    """判断日期字段是否能落到明确自然日。"""
+
+    return _normalize_trip_date(value, date.today()) is not None
+
+
+def _has_vague_date_without_specific_date(text: str) -> bool:
+    """识别“下周/下个月”等不能直接执行的时间范围。"""
+
+    if not _VAGUE_DATE_PATTERN.search(text):
+        return False
+    return not any(
+        _normalize_trip_date(candidate, date.today()) is not None
+        for candidate in _DATE_EXPRESSION_PATTERN.findall(text)
+    )
+
+
 def _build_iso_date(year: int, month: int, day: int) -> str | None:
     """将已提取的年月日安全转换为 ISO 日期。"""
 
@@ -1265,10 +1322,19 @@ def _get_missing_fields(requirements: TripRequirements) -> list[str]:
     missing_fields = [
         field_name
         for field_name in CORE_REQUIREMENT_FIELDS
-        if not getattr(requirements, field_name)
+        if (
+            not getattr(requirements, field_name)
+            or (
+                field_name == "departure_date"
+                and not _has_specific_date(requirements.departure_date)
+            )
+        )
     ]
     # 第二步：返程日期与旅行时长二选一，避免要求用户重复表达同一约束。
-    if not requirements.return_date and not requirements.trip_duration:
+    if (
+        (not requirements.return_date or not _has_specific_date(requirements.return_date))
+        and not requirements.trip_duration
+    ):
         missing_fields.insert(2, "trip_schedule")
     return missing_fields
 

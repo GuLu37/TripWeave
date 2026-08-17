@@ -2,12 +2,15 @@
 
 import asyncio
 import logging
+import math
+import re
 from datetime import date, timedelta
 
 from app.api.exception.error_handler import record_error
-from app.core.trip_duration import duration_to_days
+from app.core.trip_duration import duration_to_days, recommended_poi_limit
 from app.schemas import TripDuration, TripRequirements
-from app.tools.accommodation_tool import search_hotels_in_city
+from app.services.chat_progress import track_progress
+from app.tools.accommodation_tool import search_hotels_in_city, search_nearby_hotels
 from app.tools.attraction_tool import search_attractions_in_city
 from app.tools.food_tool import search_restaurants_in_city
 from app.tools.map_route_tool import AmapMapRouteTool
@@ -16,9 +19,18 @@ from app.tools.weather_tool import QWeatherTool
 
 logger = logging.getLogger(__name__)
 
-POI_CANDIDATE_LIMIT = 5
+POI_CANDIDATE_LIMIT = 12
+POI_SEARCH_LIMIT = 18
+POI_PREFERENCE_QUERY_LIMIT = 3
 ROUTE_CANDIDATE_LIMIT = 2
 MAX_FORECAST_DAYS = 10
+DESTINATION_HOTEL_RADIUS_METERS = 20_000
+TRANSPORT_MODE_ORDER = {
+    "driving": 0,
+    "transit": 1,
+    "walking": 2,
+    "bicycling": 3,
+}
 WEATHER_OUTSIDE_FORECAST_WINDOW_MESSAGE = (
     "距离出发时间较远，当前无法精确提供该日期的天气预报。"
     "建议在出发前十天内再次查询。"
@@ -34,6 +46,7 @@ async def collect_trip_evidence(
     *,
     map_route_tool: AmapMapRouteTool,
     weather_tool: QWeatherTool,
+    progress_agent: str = "规划 Agent",
 ) -> dict[str, object]:
     """并发收集并收敛生成方案所需的地点、天气和本地交通证据。"""
 
@@ -43,11 +56,22 @@ async def collect_trip_evidence(
 
     # 第一步：先解析目的地中心坐标；后续天气和交通仅在得到可信坐标后才执行。
     logger.info("规划 Agent 调用工具：tool=map_route_tool.geocode")
-    destination_location = await _resolve_destination_location(
-        map_route_tool,
-        destination,
-        unavailable_tools,
-    )
+    async with track_progress(
+        progress_agent,
+        "定位目的地与中心区域",
+        tool="地图地理编码",
+    ):
+        (
+            destination_location,
+            destination_city,
+            destination_city_code,
+        ) = (
+            await _resolve_destination_location(
+                map_route_tool,
+                destination,
+                unavailable_tools,
+            )
+        )
     # 第二步：城市级 POI 查询相互独立，即使地理编码失败仍可为方案提供地点候选。
     logger.info(
         "规划 Agent 调用工具：tool=accommodation_tool.search_hotels_in_city"
@@ -59,23 +83,38 @@ async def collect_trip_evidence(
         "规划 Agent 调用工具：tool=food_tool.search_restaurants_in_city"
     )
     poi_results = await asyncio.gather(
-        search_hotels_in_city(
-            map_route_tool,
-            destination,
-            _select_preference(requirements.accommodation_preferences, "酒店"),
-            limit=POI_CANDIDATE_LIMIT,
+        _run_planning_tool(
+            progress_agent,
+            "住宿 POI 查询",
+            "检索目的地周边住宿候选",
+            _search_destination_hotels(
+                map_route_tool,
+                destination,
+                destination_location,
+                requirements,
+            ),
         ),
-        search_attractions_in_city(
-            map_route_tool,
-            destination,
-            _select_preference(requirements.attraction_preferences, "景点"),
-            limit=POI_CANDIDATE_LIMIT,
+        _run_planning_tool(
+            progress_agent,
+            "景点 POI 查询",
+            "检索目的地周边景点候选",
+            _search_destination_attractions(
+                map_route_tool,
+                destination,
+                destination_city_code,
+                requirements,
+            ),
         ),
-        search_restaurants_in_city(
-            map_route_tool,
-            destination,
-            _select_preference(requirements.dining_preferences, "餐厅"),
-            limit=POI_CANDIDATE_LIMIT,
+        _run_planning_tool(
+            progress_agent,
+            "餐饮 POI 查询",
+            "检索目的地周边餐饮候选",
+            _search_destination_restaurants(
+                map_route_tool,
+                destination,
+                destination_city_code,
+                requirements,
+            ),
         ),
         return_exceptions=True,
     )
@@ -83,6 +122,10 @@ async def collect_trip_evidence(
         "accommodation_search",
         poi_results[0],
         unavailable_tools,
+        destination_location=destination_location,
+        max_distance_meters=(
+            DESTINATION_HOTEL_RADIUS_METERS if destination_location else None
+        ),
     )
     accommodation_candidates = _rank_candidates(
         accommodation_candidates,
@@ -92,6 +135,7 @@ async def collect_trip_evidence(
         "attraction_search",
         poi_results[1],
         unavailable_tools,
+        destination_location=destination_location,
     )
     attraction_candidates = _rank_candidates(
         attraction_candidates,
@@ -101,10 +145,16 @@ async def collect_trip_evidence(
         "food_search",
         poi_results[2],
         unavailable_tools,
+        destination_location=destination_location,
     )
     food_candidates = _rank_candidates(
         food_candidates,
         requirements.dining_preferences,
+    )
+    attraction_candidates, food_candidates = _select_poi_candidates(
+        attraction_candidates,
+        food_candidates,
+        limit=recommended_poi_limit(requirements),
     )
     logger.info(
         "规划 Agent 工具调用完成：tool=accommodation_tool.search_hotels_in_city "
@@ -128,6 +178,7 @@ async def collect_trip_evidence(
         destination_location,
         weather_tool,
         unavailable_tools,
+        progress_agent,
     )
     # 第四步：以首个住宿候选或目的地中心为交通锚点，比较少量代表性景点和餐饮候选。
     transport_evidence = await _collect_transport_evidence(
@@ -138,9 +189,12 @@ async def collect_trip_evidence(
         food_candidates,
         map_route_tool,
         unavailable_tools,
+        progress_agent,
     )
     return {
         "destination_location": destination_location,
+        "destination_city": destination_city,
+        "destination_city_code": destination_city_code,
         "accommodation_candidates": accommodation_candidates,
         "attraction_candidates": attraction_candidates,
         "food_candidates": food_candidates,
@@ -159,7 +213,7 @@ async def _resolve_destination_location(
     map_route_tool: AmapMapRouteTool,
     destination: str,
     unavailable_tools: list[dict[str, str]],
-) -> str | None:
+) -> tuple[str | None, str | None, str | None]:
     """解析目的地中心坐标，并将失败转换为可展示的工具状态。"""
 
     try:
@@ -167,7 +221,7 @@ async def _resolve_destination_location(
         result = await map_route_tool.geocode(destination, city=destination)
     except Exception as error:
         _record_tool_failure("destination_geocode", error, unavailable_tools)
-        return None
+        return None, None, None
     # 第二步：只接受首个候选的合法高德坐标；空结果应被视为不可用证据而非默认成功。
     geocodes = result.get("geocodes")
     if not isinstance(geocodes, list) or not geocodes:
@@ -178,7 +232,7 @@ async def _resolve_destination_location(
             error_code="TOOL_RESULT_EMPTY",
             error_message="地图工具未返回可用的地理编码结果。",
         )
-        return None
+        return None, None, None
     first_geocode = geocodes[0]
     if not isinstance(first_geocode, dict):
         _record_tool_failure(
@@ -188,7 +242,7 @@ async def _resolve_destination_location(
             error_code="TOOL_RESULT_INVALID",
             error_message="地图工具返回的地理编码结构无效。",
         )
-        return None
+        return None, None, None
     location = first_geocode.get("location")
     if not _is_coordinate(location):
         _record_tool_failure(
@@ -198,9 +252,162 @@ async def _resolve_destination_location(
             error_code="TOOL_RESULT_INVALID",
             error_message="地图工具返回的地理编码缺少合法坐标。",
         )
-        return None
+        return None, None, None
     logger.info("规划 Agent 工具调用完成：tool=map_route_tool.geocode result_count=1")
-    return location
+    city = (
+        _safe_location_name(first_geocode.get("city"))
+        or _safe_text(first_geocode.get("province"))
+    )
+    city_code = _city_adcode(first_geocode.get("adcode"))
+    return location, city, city_code
+
+
+async def _search_destination_hotels(
+    map_route_tool: AmapMapRouteTool,
+    destination: str,
+    destination_location: str | None,
+    requirements: TripRequirements,
+) -> dict[str, object]:
+    keyword = _select_preference(requirements.accommodation_preferences, "酒店")
+    if destination_location:
+        return await search_nearby_hotels(
+            map_route_tool,
+            destination_location,
+            keywords=keyword,
+            radius_meters=DESTINATION_HOTEL_RADIUS_METERS,
+            limit=POI_SEARCH_LIMIT,
+        )
+    return await search_hotels_in_city(
+        map_route_tool,
+        destination,
+        keyword,
+        limit=POI_SEARCH_LIMIT,
+    )
+
+
+async def _search_destination_attractions(
+    map_route_tool: AmapMapRouteTool,
+    destination: str,
+    destination_city_code: str | None,
+    requirements: TripRequirements,
+) -> dict[str, object]:
+    keywords = _select_preference_keywords(
+        requirements.attraction_preferences,
+        "景点",
+    )
+    per_keyword_limit = max(1, POI_SEARCH_LIMIT // len(keywords))
+    results = await asyncio.gather(
+        *[
+            search_attractions_in_city(
+                map_route_tool,
+                destination_city_code or destination,
+                keyword,
+                limit=per_keyword_limit,
+            )
+            for keyword in keywords
+        ],
+        return_exceptions=True,
+    )
+    merged = _merge_poi_search_results(results)
+    return await _fallback_to_generic_city_poi_search(
+        merged,
+        keywords,
+        "景点",
+        lambda: search_attractions_in_city(
+            map_route_tool,
+            destination_city_code or destination,
+            "景点",
+            limit=POI_SEARCH_LIMIT,
+        ),
+    )
+
+
+async def _search_destination_restaurants(
+    map_route_tool: AmapMapRouteTool,
+    destination: str,
+    destination_city_code: str | None,
+    requirements: TripRequirements,
+) -> dict[str, object]:
+    keywords = _select_preference_keywords(
+        requirements.dining_preferences,
+        "餐厅",
+    )
+    per_keyword_limit = max(1, POI_SEARCH_LIMIT // len(keywords))
+    results = await asyncio.gather(
+        *[
+            search_restaurants_in_city(
+                map_route_tool,
+                destination_city_code or destination,
+                keyword,
+                limit=per_keyword_limit,
+            )
+            for keyword in keywords
+        ],
+        return_exceptions=True,
+    )
+    merged = _merge_poi_search_results(results)
+    return await _fallback_to_generic_city_poi_search(
+        merged,
+        keywords,
+        "餐厅",
+        lambda: search_restaurants_in_city(
+            map_route_tool,
+            destination_city_code or destination,
+            "餐厅",
+            limit=POI_SEARCH_LIMIT,
+        ),
+    )
+
+
+async def _fallback_to_generic_city_poi_search(
+    result: dict[str, object],
+    keywords: list[str],
+    default_keyword: str,
+    operation,
+) -> dict[str, object]:
+    """旧偏好在新城市无结果时，回退到严格同城的通用分类检索。"""
+
+    pois = result.get("pois")
+    if (
+        default_keyword in keywords
+        or isinstance(pois, list) and pois
+    ):
+        return result
+    try:
+        fallback_result = await operation()
+    except Exception:
+        # 专项检索本身已成功但没有命中时，回退失败不能把有效空结果误报为工具故障。
+        return result
+    fallback_pois = fallback_result.get("pois") if isinstance(fallback_result, dict) else None
+    if not isinstance(fallback_pois, list) or not fallback_pois:
+        return result
+    logger.info(
+        "目的地 POI 专项偏好无候选，已回退到同城通用%s检索：result_count=%s",
+        default_keyword,
+        len(fallback_pois),
+    )
+    return {"pois": fallback_pois}
+
+
+def _merge_poi_search_results(
+    results: list[object],
+) -> dict[str, object]:
+    """合并多个偏好查询，确保每个明确偏好都保留候选配额。"""
+
+    pois: list[object] = []
+    first_error: Exception | None = None
+    for result in results:
+        if isinstance(result, Exception):
+            first_error = first_error or result
+            continue
+        if not isinstance(result, dict):
+            continue
+        result_pois = result.get("pois")
+        if isinstance(result_pois, list):
+            pois.extend(result_pois)
+    if not pois and first_error is not None:
+        raise first_error
+    return {"pois": pois}
 
 
 async def _collect_weather_evidence(
@@ -208,8 +415,9 @@ async def _collect_weather_evidence(
     destination_location: str | None,
     weather_tool: QWeatherTool,
     unavailable_tools: list[dict[str, str]],
+    progress_agent: str,
 ) -> dict[str, object]:
-    """按出行日期窗口收集每日预报与当前预警摘要。"""
+    """按出行日期窗口收集每日天气预报。"""
 
     # 第一步：没有可信坐标时不向天气供应商发送无效请求，并明确原因供模型输出待确认项。
     if destination_location is None:
@@ -226,15 +434,17 @@ async def _collect_weather_evidence(
             "message": WEATHER_OUTSIDE_FORECAST_WINDOW_MESSAGE,
         }
 
-    # 第三步：预报与当前预警互不依赖，并发查询缩短规划等待；预警必须注明它是当前状态。
+    # 第三步：只查询实际行程日期内的每日预报，避免当前预警干扰未来行程判断。
     logger.info("规划 Agent 调用工具：tool=weather_tool.get_daily_forecast")
-    logger.info("规划 Agent 调用工具：tool=weather_tool.get_weather_alerts")
-    results = await asyncio.gather(
-        weather_tool.get_daily_forecast(destination_location, days=forecast_days),
-        weather_tool.get_weather_alerts(destination_location),
-        return_exceptions=True,
-    )
-    daily_result, alerts_result = results
+    try:
+        daily_result = await _run_planning_tool(
+            progress_agent,
+            "天气预报",
+            "查询行程日期内的天气预报",
+            weather_tool.get_daily_forecast(destination_location, days=forecast_days),
+        )
+    except Exception as error:
+        daily_result = error
     evidence: dict[str, object] = {"status": "available", "forecast": []}
     if isinstance(daily_result, Exception):
         _record_tool_failure(
@@ -271,21 +481,6 @@ async def _collect_weather_evidence(
             "result_count=%s",
             len(forecast),
         )
-    if isinstance(alerts_result, Exception):
-        _record_tool_failure(
-            "weather_alerts",
-            alerts_result,
-            unavailable_tools,
-            error_already_logged=True,
-        )
-        evidence["current_alerts"] = []
-    else:
-        evidence["current_alerts"] = _compact_weather_alerts(alerts_result)
-        logger.info(
-            "规划 Agent 工具调用完成：tool=weather_tool.get_weather_alerts "
-            "result_count=%s",
-            len(evidence["current_alerts"]),
-        )
     return evidence
 
 
@@ -297,6 +492,7 @@ async def _collect_transport_evidence(
     food_candidates: list[dict[str, object]],
     map_route_tool: AmapMapRouteTool,
     unavailable_tools: list[dict[str, str]],
+    progress_agent: str,
 ) -> dict[str, object]:
     """以住宿或目的地中心为锚点生成少量可比较的本地交通摘要。"""
 
@@ -318,10 +514,15 @@ async def _collect_transport_evidence(
         )
     results = await asyncio.gather(
         *[
-            transport_tool.plan_local_transport(
-                anchor["location"],
-                target["location"],
-                city=city,
+            _run_planning_tool(
+                progress_agent,
+                "本地路线查询",
+                f"比较{_route_target_label(target['category'])}的本地交通方式",
+                transport_tool.plan_local_transport(
+                    anchor["location"],
+                    target["location"],
+                    city=city,
+                ),
             )
             for target in targets
         ],
@@ -359,10 +560,36 @@ async def _collect_transport_evidence(
     }
 
 
+async def _run_planning_tool(
+    progress_agent: str,
+    tool: str,
+    action: str,
+    operation,
+):
+    """把一次真实工具调用映射为面向前端的安全进度。"""
+
+    async with track_progress(progress_agent, action, tool=tool) as progress:
+        try:
+            return await operation
+        except Exception:
+            # 外部工具失败由证据层降级处理，不应在界面上伪装成仍在执行。
+            progress.mark_unavailable()
+            raise
+
+
+def _route_target_label(category: object) -> str:
+    """将内部目标类别转换为不含地点正文的展示名称。"""
+
+    return "景点" if category == "attraction" else "餐饮地点"
+
+
 def _extract_poi_result(
     tool_name: str,
     result: object,
     unavailable_tools: list[dict[str, str]],
+    *,
+    destination_location: str | None = None,
+    max_distance_meters: int | None = None,
 ) -> list[dict[str, object]]:
     """将 POI 原始响应裁剪为规划可安全消费的候选字段。"""
 
@@ -392,12 +619,35 @@ def _extract_poi_result(
 
     # 第二步：只保留名称、地址、坐标、分类和距离，过滤缺坐标项以确保可进入路线规划。
     candidates: list[dict[str, object]] = []
-    for poi in pois[:POI_CANDIDATE_LIMIT]:
+    destination_coordinate = _parse_coordinate(destination_location)
+    effective_distance_limit = (
+        max_distance_meters
+        if max_distance_meters is not None
+        else None
+    )
+    for poi in pois[:POI_SEARCH_LIMIT]:
         if not isinstance(poi, dict):
             continue
         location = poi.get("location")
         name = _safe_text(poi.get("name"))
+        province = _safe_text(poi.get("pname"))
+        city = _safe_location_name(poi.get("cityname"))
+        distance_meters = _safe_non_negative_int(poi.get("distance"))
         if name is None or not _is_coordinate(location):
+            continue
+        # 城市范围已由高德文本检索的 citylimit=true 约束。不要再依赖 POI
+        # 响应中的 cityname 二次过滤：部分城市该字段为空或结构不稳定，会把同城结果全筛掉。
+        coordinate_distance = _coordinate_distance_meters(
+            destination_coordinate,
+            _parse_coordinate(location),
+        )
+        if coordinate_distance is not None:
+            distance_meters = coordinate_distance
+        if (
+            effective_distance_limit is not None
+            and distance_meters is not None
+            and distance_meters > effective_distance_limit
+        ):
             continue
         candidates.append(
             {
@@ -405,7 +655,9 @@ def _extract_poi_result(
                 "location": location,
                 "address": _safe_text(poi.get("address")),
                 "type": _safe_text(poi.get("type")),
-                "distance_meters": _safe_non_negative_int(poi.get("distance")),
+                "province": province,
+                "city": city,
+                "distance_meters": distance_meters,
             }
         )
     return candidates
@@ -425,13 +677,101 @@ def _rank_candidates(
     ]
 
     # 第二步：优先名称、分类或地址匹配更多偏好的候选；距离缺失与并列时保持供应商原始顺序。
-    return sorted(
+    ranked_candidates = sorted(
         candidates,
         key=lambda candidate: (
             -_candidate_preference_score(candidate, normalized_preferences),
             _candidate_distance_sort_value(candidate),
         ),
     )
+    return _deduplicate_candidates(ranked_candidates)[:POI_CANDIDATE_LIMIT]
+
+
+def _select_poi_candidates(
+    attraction_candidates: list[dict[str, object]],
+    food_candidates: list[dict[str, object]],
+    *,
+    limit: int,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """在景点和餐饮候选之间均衡分配本轮地点推荐数量。"""
+
+    attraction_limit = (limit + 1) // 2
+    food_limit = limit // 2
+    selected_attractions = attraction_candidates[:attraction_limit]
+    selected_food = food_candidates[:food_limit]
+    remaining = limit - len(selected_attractions) - len(selected_food)
+    if remaining <= 0:
+        return selected_attractions, selected_food
+
+    for candidates, selected in (
+        (attraction_candidates, selected_attractions),
+        (food_candidates, selected_food),
+    ):
+        if remaining <= 0:
+            break
+        extras = candidates[len(selected) : len(selected) + remaining]
+        selected.extend(extras)
+        remaining -= len(extras)
+    return selected_attractions, selected_food
+
+
+def _deduplicate_candidates(
+    candidates: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """移除同一地点、分店及子地点的重复候选，保留排序更靠前的一项。"""
+
+    unique_candidates: list[dict[str, object]] = []
+    for candidate in candidates:
+        name = _safe_text(candidate.get("name"))
+        if name is None:
+            continue
+        if any(
+            _same_or_nested_place_name(
+                name,
+                _safe_text(existing.get("name")) or "",
+            )
+            for existing in unique_candidates
+        ):
+            continue
+        unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _same_or_nested_place_name(first: str, second: str) -> bool:
+    """判断两个地点是否为同名、不同分店或泛景点与子景点的重复表述。"""
+
+    normalized_first = _normalize_place_name(first)
+    normalized_second = _normalize_place_name(second)
+    if not normalized_first or not normalized_second:
+        return False
+    base_first = _place_base_name(first)
+    base_second = _place_base_name(second)
+    return (
+        normalized_first == normalized_second
+        or (base_first and base_first == base_second)
+        or (
+            min(len(normalized_first), len(normalized_second)) >= 4
+            and (
+                normalized_first in normalized_second
+                or normalized_second in normalized_first
+            )
+        )
+    )
+
+
+def _normalize_place_name(value: str) -> str:
+    return re.sub(r"[\s()（）\[\]【】\-—_·、,，.。]", "", value)
+
+
+def _place_base_name(value: str) -> str:
+    """去掉名称末尾的分店或门店括号信息，用于同品牌候选去重。"""
+
+    without_branch_suffix = re.sub(
+        r"(?:\s*(?:\([^()]{1,40}\)|（[^（）]{1,40}）|\[[^\[\]]{1,40}\]))+\s*$",
+        "",
+        value,
+    )
+    return _normalize_place_name(without_branch_suffix)
 
 
 def _candidate_preference_score(
@@ -620,29 +960,6 @@ def _first_non_none(*values: object) -> object | None:
     return next((value for value in values if value is not None), None)
 
 
-def _compact_weather_alerts(payload: dict[str, object]) -> list[dict[str, object]]:
-    """提取当前生效预警中的事件、等级和时间，避免注入完整预警正文。"""
-
-    # 第一步：兼容 v7 的 warning 和旧版测试桩的 alerts，当前无预警仍是正常业务状态。
-    alerts = payload.get("alerts")
-    if alerts is None:
-        alerts = payload.get("warning")
-    if not isinstance(alerts, list):
-        return []
-    compact_alerts: list[dict[str, object]] = []
-    for item in alerts[:3]:
-        if not isinstance(item, dict):
-            continue
-        compact_alerts.append(
-            {
-                "event": _safe_text(item.get("event")),
-                "severity": _safe_text(item.get("severity")),
-                "effective_time": _first_text(item, "effectiveTime", "publishTime"),
-            }
-        )
-    return compact_alerts
-
-
 def _compact_transport_options(payload: dict[str, object]) -> list[dict[str, object]]:
     """保留交通比较所需的方式、距离与耗时，不传递高德完整路线明细。"""
 
@@ -666,7 +983,24 @@ def _compact_transport_options(payload: dict[str, object]) -> list[dict[str, obj
                 "distance_text": _format_distance(distance_meters),
             }
         )
-    return compact_options
+    return sorted(
+        compact_options,
+        key=lambda option: TRANSPORT_MODE_ORDER.get(
+            _transport_mode_key(option.get("mode_label")),
+            len(TRANSPORT_MODE_ORDER),
+        ),
+    )
+
+
+def _transport_mode_key(mode_label: object) -> str | None:
+    """将交通方式中文标签转换为稳定排序键。"""
+
+    return {
+        "驾车": "driving",
+        "公交": "transit",
+        "步行": "walking",
+        "骑行": "bicycling",
+    }.get(mode_label) if isinstance(mode_label, str) else None
 
 
 def _transport_mode_label(mode: object) -> str | None:
@@ -797,6 +1131,22 @@ def _select_preference(preferences: list[str], default_value: str) -> str:
     return default_value
 
 
+def _select_preference_keywords(
+    preferences: list[str],
+    default_value: str,
+) -> list[str]:
+    """选择少量去重后的偏好关键词，避免新指定地点被首项偏好遮蔽。"""
+
+    keywords: list[str] = []
+    for preference in preferences:
+        normalized_preference = preference.strip()
+        if normalized_preference and normalized_preference not in keywords:
+            keywords.append(normalized_preference)
+        if len(keywords) == POI_PREFERENCE_QUERY_LIMIT:
+            break
+    return keywords or [default_value]
+
+
 def _record_tool_failure(
     tool_name: str,
     error: Exception,
@@ -836,11 +1186,49 @@ def _is_coordinate(value: object) -> bool:
     if len(parts) != 2 or not all(parts):
         return False
     try:
-        float(parts[0])
-        float(parts[1])
+        longitude = float(parts[0])
+        latitude = float(parts[1])
     except ValueError:
         return False
-    return True
+    return -180 <= longitude <= 180 and -90 <= latitude <= 90
+
+
+def _parse_coordinate(value: object) -> tuple[float, float] | None:
+    """解析高德经纬度文本。"""
+
+    if not _is_coordinate(value) or not isinstance(value, str):
+        return None
+    longitude, latitude = (float(part.strip()) for part in value.split(",", 1))
+    return longitude, latitude
+
+
+def _coordinate_distance_meters(
+    first: tuple[float, float] | None,
+    second: tuple[float, float] | None,
+) -> int | None:
+    """按经纬度估算两个 POI 间的直线距离。"""
+
+    if first is None or second is None:
+        return None
+    first_lng, first_lat = first
+    second_lng, second_lat = second
+    radius_meters = 6_371_008.8
+    lat_delta = math.radians(second_lat - first_lat)
+    lng_delta = math.radians(second_lng - first_lng)
+    first_lat_rad = math.radians(first_lat)
+    second_lat_rad = math.radians(second_lat)
+    haversine = (
+        math.sin(lat_delta / 2) ** 2
+        + math.cos(first_lat_rad)
+        * math.cos(second_lat_rad)
+        * math.sin(lng_delta / 2) ** 2
+    )
+    clamped = min(1, max(0, haversine))
+    return round(
+        radius_meters
+        * 2
+        * math.atan2(math.sqrt(clamped), math.sqrt(1 - clamped))
+    )
 
 
 def _safe_text(value: object) -> str | None:
@@ -851,6 +1239,30 @@ def _safe_text(value: object) -> str | None:
         return None
     normalized_value = value.strip()
     return normalized_value or None
+
+
+def _safe_location_name(value: object) -> str | None:
+    """兼容高德在不同地理编码层级返回的城市字段结构。"""
+
+    if isinstance(value, list):
+        return next(
+            (
+                text
+                for item in value
+                if (text := _safe_text(item)) is not None
+            ),
+            None,
+        )
+    return _safe_text(value)
+
+
+def _city_adcode(value: object) -> str | None:
+    """将行政区编码归一为地级市编码，供同市 POI 检索使用。"""
+
+    adcode = _safe_text(value)
+    if adcode is None or len(adcode) != 6 or not adcode.isdigit():
+        return None
+    return f"{adcode[:4]}00"
 
 
 def _safe_non_negative_int(value: object) -> int | None:

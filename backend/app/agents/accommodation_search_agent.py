@@ -4,6 +4,7 @@ from datetime import date, timedelta
 
 from app.core.trip_duration import duration_to_days
 from app.schemas import TripRequirements
+from app.services.chat_progress import track_progress
 from app.tools.hotel_search_tool import search_hotels
 
 
@@ -13,13 +14,18 @@ async def search_accommodation(
     """把完整住宿需求交给本地酒店估算工具。"""
 
     check_out = _get_check_out_date(requirements)
-    return await search_hotels(
-        city=requirements.destination or "",
-        check_in=requirements.departure_date or "",
-        check_out=check_out or "",
-        travelers=requirements.traveler_count or 1,
-        style=_get_hotel_style(requirements),
-    )
+    async with track_progress(
+        "住宿查询 Agent",
+        "生成酒店价格、房型和库存参考",
+        tool="酒店价格估算",
+    ):
+        return await search_hotels(
+            city=requirements.destination or "",
+            check_in=requirements.departure_date or "",
+            check_out=check_out or "",
+            travelers=requirements.traveler_count or 1,
+            style=_get_hotel_style(requirements),
+        )
 
 
 def _get_check_out_date(requirements: TripRequirements) -> str | None:

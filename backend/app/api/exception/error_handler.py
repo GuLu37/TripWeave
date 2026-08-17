@@ -2,7 +2,6 @@
 
 import logging
 import re
-from typing import Any
 
 import httpx
 from pydantic import ValidationError
@@ -137,13 +136,3 @@ def _safe_error_text(value: str) -> str:
 
     normalized = _SECRET_PATTERN.sub(r"\1=***", value)
     return normalized[:_MAX_ERROR_TEXT]
-
-
-def error_response_details(error: Exception) -> Any:
-    """提取可安全返回给 API 客户端的异常详情。"""
-
-    return describe_error(
-        error,
-        default_code="INTERNAL_SERVER_ERROR",
-        default_message="服务内部错误，请稍后再试。",
-    )["details"]

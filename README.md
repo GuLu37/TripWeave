@@ -13,7 +13,7 @@ TripWeave 当前是一个以对话为入口的旅差规划 Demo：
 - 通过 `conversation_id` 关联 LangGraph `thread_id`，工作流状态由 SQLite Checkpointer 持久化。
 - 服务端 SQLite Checkpointer 保存会话历史；浏览器回传的本地上下文窗口只作为兼容输入。
 - 高德和风天气能力通过后端 Tools 调用；酒店和城际交通当前使用本地估算 Tools，不代表实时价格、库存或余票。
-- 用户确认方案后，后端异步补充 Unsplash 景点/美食图片和高德城市内路线摘要，并通过 `confirmed_plan.details` 返回前端。
+- 用户确认方案后，后端补充高德地图距离和按路线规划顺序排列的城市内路线摘要，并通过 `confirmed_plan.details` 返回前端。
 - 当前只生成推荐方案，不执行真实购票、订房或支付。
 
 当前默认可以只配置 DeepSeek。未配置的备用供应商会被跳过；所有供应商都不可用时，接口会返回统一业务错误。
@@ -48,7 +48,7 @@ flowchart TD
     P --> T{"用户下一轮动作"}
     T -- "修改" --> G
     T -- "确认" --> U["生成 ConfirmedTripPlan"]
-    U --> V["Unsplash 图片 + 高德路线取证"]
+    U --> V["高德地图与城市内路线取证"]
     V --> W["前端展示完整确认方案"]
 ```
 
@@ -80,7 +80,7 @@ flowchart LR
 | 城际交通查询 Agent | 通过本地交通估算 Tool 生成飞机和火车班次参考 | 已实现 |
 | 审核总结 Agent | 根据方案、规则校验和工具证据生成总结、风险和待确认项；状态仍由本地规则决定 | 已实现 |
 | 会话历史策略 | Checkpointer 保存最多 120 条；模型每次读取最近 8 条和其外 6 条历史，不调用摘要 Agent | 已实现 |
-| 用户确认 | 由 LangGraph 节点处理，确认后生成带图片和路线详情的 `ConfirmedTripPlan` | 已实现 |
+| 用户确认 | 由 LangGraph 节点处理，确认后生成带高德地图和路线详情的 `ConfirmedTripPlan` | 已实现 |
 
 吃、住、行、景点和天气不再拆成独立业务 Agent。规划取证层通过 Tools 调用这些能力，减少多 Agent 转发和自由文本传递。
 
@@ -180,8 +180,7 @@ fixed_schedule: list[str]
 
 确认成功后，`ConversationAnalysis.confirmed_plan` 会额外包含：
 
-- `details.images`：Unsplash 景点和美食图片、缩略图、描述、摄影者和来源链接。
-- `details.routes`：从目的地中心到代表性景点/餐饮候选的公交、步行和驾车路线摘要。
+- `details.routes`：按路线规划中景点/美食顺序生成的相邻地点公交、步行和驾车路线摘要。
 - `details.tool_status`：`available`、`unavailable` 或 `skipped`，第三方不可用时不阻断确认。
 
 ## 5. 记忆与请求状态
@@ -244,8 +243,7 @@ fixed_schedule: list[str]
 
 | 文件 | 能力 |
 | --- | --- |
-| `backend/app/services/unsplash_service.py` | 后端异步搜索 Unsplash 图片并提取安全展示字段 |
-| `backend/app/services/confirmed_trip_service.py` | 确认后并发收集图片和高德路线，统一降级为可展示状态 |
+| `backend/app/services/confirmed_trip_service.py` | 确认后收集高德地图和城市内路线，统一降级为可展示状态 |
 
 ### 6.3 LLM 集成
 
@@ -344,8 +342,6 @@ npm run build
 | `AMAP_WEB_SERVICE_BASE_URL` | `https://restapi.amap.com` | 高德服务地址 |
 | `QWEATHER_API_HOST` | - | 和风天气控制台分配的专属 Host |
 | `QWEATHER_API_KEY` | - | 和风天气服务端 Key |
-| `UNSPLASH_ACCESS_KEY` | - | Unsplash 图片搜索 Access Key |
-| `UNSPLASH_BASE_URL` | `https://api.unsplash.com` | Unsplash API 地址 |
 | `LANGGRAPH_CHECKPOINT_PATH` | `data/tripweave_checkpoints.sqlite` | LangGraph SQLite 检查点文件，相对 `backend` 目录 |
 | `CORS_ALLOW_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | 允许访问后端的前端地址 |
 | `LOG_MAX_BYTES` | `1048576` | 单个日志文件最大字节数 |
@@ -487,7 +483,6 @@ TripWeave/
 │   │   │   ├── transport_tool.py
 │   │   │   └── weather_tool.py
 │   │   ├── services/
-│   │   │   ├── unsplash_service.py
 │   │   │   └── confirmed_trip_service.py
 │   │   ├── integrations/
 │   │   │   └── llm/

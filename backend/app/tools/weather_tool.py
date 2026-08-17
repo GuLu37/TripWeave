@@ -2,13 +2,10 @@
 
 规划 Agent 应先从高德地点检索或地理编码结果中取得 ``"经度,纬度"``，再调用本工具：
 
-1. ``get_daily_forecast`` 用于按天安排景点、户外活动和备选日期。
-2. ``get_hourly_forecast`` 用于安排具体时段、判断降水概率和风力风险。
-3. ``get_current_weather`` 用于确认出发前或当日的实时天气。
-4. ``get_weather_alerts`` 用于检查目的地是否存在生效中的极端天气预警。
+``get_daily_forecast`` 用于按天安排景点、户外活动和备选日期。
 
 所有公开方法返回已验证的和风天气 JSON。工具同时兼容旧版测试桩中的
-``metadata`` 结构，以及当前 v7 接口中的 ``code``、``daily`` 和 ``warning`` 字段。
+``metadata`` 结构，以及当前 v7 接口中的 ``code`` 和 ``daily`` 字段。
 """
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -27,19 +24,16 @@ logger = logging.getLogger(__name__)
 
 
 class QWeatherTool:
-    """封装和风天气的实时天气、预报与预警接口。
+    """封装和风天气的每日预报接口。
 
     Agent 调用建议：
 
     - 已有每日行程框架时调用 ``get_daily_forecast``，读取 ``days`` 评估高低温、降水和紫外线。
-    - 需要把活动排到上午、下午或晚上时调用 ``get_hourly_forecast``，读取 ``hours``。
-    - 输出最终方案前调用 ``get_weather_alerts``，存在 ``alerts`` 时必须在方案中显式提示。
 
     Example:
         ```python
         weather_tool = QWeatherTool()
         daily = await weather_tool.get_daily_forecast("120.15507,30.274085", days=3)
-        alerts = await weather_tool.get_weather_alerts("120.15507,30.274085")
         ```
     """
 
@@ -77,52 +71,12 @@ class QWeatherTool:
         self._timeout_seconds = timeout_seconds
         self._transport = transport
 
-    async def get_current_weather(
-        self,
-        location: str,
-        *,
-        language: WeatherLanguage = "zh",
-        local_time: bool = True,
-    ) -> dict[str, object]:
-        """查询指定坐标的实时天气，用于当日行程风险判断。
-
-        Args:
-            location: 必填 ``"经度,纬度"`` 坐标。可直接传高德返回的坐标，工具会按和风
-                天气要求转换为最多两位小数。
-            language: 返回文本语言，当前支持 ``"zh"`` 或 ``"en"``，默认中文。
-            local_time: 是否使用目的地本地时间，默认 ``True``。
-
-        Returns:
-            实时天气 JSON。Agent 通常读取 ``condition.text``、``temperature.value``、
-            ``feelsLike.value``、``precipitation``、``wind`` 和 ``visibility``。
-
-        Raises:
-            QWeatherException: 坐标或语言非法时抛出 ``QWEATHER_PARAMETER_INVALID``；
-                网络、鉴权或供应商响应异常时抛出对应的 ``QWEATHER_*`` 错误。
-
-        Example:
-            ```python
-            current = await weather_tool.get_current_weather("116.397,39.908")
-            condition = current["condition"]["text"]
-            ```
-        """
-
-        # 第一步：标准化坐标与语言后，使用 v7 实时天气端点和 location 查询参数。
-        latitude, longitude = _require_coordinate(location)
-        query_params = _build_query_params(language)
-        query_params["location"] = f"{longitude},{latitude}"
-        return await self._request(
-            "/v7/weather/now",
-            query_params,
-        )
-
     async def get_daily_forecast(
         self,
         location: str,
         *,
         days: int = 7,
         language: WeatherLanguage = "zh",
-        local_time: bool = True,
     ) -> dict[str, object]:
         """查询指定坐标未来 1 至 10 天的每日天气预报。
 
@@ -130,7 +84,6 @@ class QWeatherTool:
             location: 必填 ``"经度,纬度"`` 坐标；工具会收敛到和风天气要求的两位小数。
             days: 预报天数，范围 1 到 10，默认 7。规划一周内行程时建议按实际天数传入。
             language: 返回文本语言，当前支持 ``"zh"`` 或 ``"en"``。
-            local_time: 是否使用目的地本地时间，默认 ``True``。
 
         Returns:
             每日预报 JSON。Agent 应从 ``days`` 读取日期范围、最高/最低温度、白天与夜间
@@ -164,97 +117,6 @@ class QWeatherTool:
         )
         # 第三步：只保留调用方请求的天数，并提供旧版 days 别名供规划层兼容读取。
         return _limit_daily_forecast(payload, days)
-
-    async def get_hourly_forecast(
-        self,
-        location: str,
-        *,
-        hours: int = 24,
-        language: WeatherLanguage = "zh",
-        local_time: bool = True,
-    ) -> dict[str, object]:
-        """查询指定坐标未来 1 至 240 小时的逐小时天气预报。
-
-        Args:
-            location: 必填 ``"经度,纬度"`` 坐标；工具会收敛到最多两位小数。
-            hours: 预报小时数，范围 1 到 240，默认 24。仅在排具体时段时请求较长范围。
-            language: 返回文本语言，当前支持 ``"zh"`` 或 ``"en"``。
-            local_time: 是否使用目的地本地时间，默认 ``True``。
-
-        Returns:
-            逐小时预报 JSON。Agent 应从 ``hours`` 中读取 ``forecastTime``、天气现象、
-            温度、降水概率、阵风、能见度和紫外线；不要只根据单一温度字段判断活动风险。
-
-        Raises:
-            QWeatherException: ``hours`` 超出范围、坐标或语言非法时抛出
-                ``QWEATHER_PARAMETER_INVALID``；上游失败时抛出相应 ``QWEATHER_*`` 错误。
-
-        Example:
-            ```python
-            forecast = await weather_tool.get_hourly_forecast(
-                "121.4737,31.2304",
-                hours=48,
-            )
-            hourly_items = forecast["hours"]
-            ```
-        """
-
-        # 第一步：在请求前限制规划层允许的小时范围，避免模型请求把无效参数交给供应商。
-        if (
-            not isinstance(hours, int)
-            or isinstance(hours, bool)
-            or not 1 <= hours <= 240
-        ):
-            raise QWeatherException.invalid_parameter("hours")
-        latitude, longitude = _require_coordinate(location)
-        query_params = _build_query_params(language)
-        query_params["location"] = f"{longitude},{latitude}"
-        # 第二步：将业务所需小时数映射为 v7 支持的 24、72、168、240 小时端点。
-        endpoint_hours = _select_hourly_endpoint_hours(hours)
-        return await self._request(
-            f"/v7/weather/{endpoint_hours}h",
-            query_params,
-        )
-
-    async def get_weather_alerts(
-        self,
-        location: str,
-        *,
-        language: WeatherLanguage = "zh",
-        local_time: bool = True,
-    ) -> dict[str, object]:
-        """查询指定坐标当前生效的官方极端天气预警。
-
-        Args:
-            location: 必填 ``"经度,纬度"`` 坐标；工具会自动调整为预警接口要求的
-                ``纬度/经度`` 路径顺序。
-            language: 返回文本语言，当前支持 ``"zh"`` 或 ``"en"``。
-            local_time: 是否使用目的地本地时间，默认 ``True``。
-
-        Returns:
-            天气预警 JSON。``metadata.zeroResult`` 为 ``True`` 表示没有生效预警；
-            否则 Agent 必须检查 ``alerts`` 中的事件类型、严重程度、发布时间和正文。
-
-        Raises:
-            QWeatherException: 坐标或语言非法时抛出 ``QWEATHER_PARAMETER_INVALID``；
-                上游失败时抛出相应 ``QWEATHER_*`` 错误。
-
-        Example:
-            ```python
-            alerts = await weather_tool.get_weather_alerts("116.397,39.908")
-            has_alert = not alerts["metadata"]["zeroResult"]
-            ```
-        """
-
-        # 第一步：标准化经纬度并转换为 v7 预警接口所需的 location 查询参数。
-        latitude, longitude = _require_coordinate(location)
-        query_params = _build_query_params(language)
-        query_params["location"] = f"{longitude},{latitude}"
-        # 第二步：仅查询当前生效预警，避免将历史或失效事件误写入旅行风险提示。
-        return await self._request(
-            "/v7/warning/now",
-            query_params,
-        )
 
     async def _request(
         self,
@@ -501,19 +363,6 @@ def _select_daily_endpoint_days(days: int) -> int:
     return 10
 
 
-def _select_hourly_endpoint_hours(hours: int) -> int:
-    """将业务预报小时数映射为和风天气 v7 支持的逐小时端点。"""
-
-    # 第一步：v7 逐小时端点按固定档位提供，选择不小于请求范围的最小档位。
-    if hours <= 24:
-        return 24
-    if hours <= 72:
-        return 72
-    if hours <= 168:
-        return 168
-    return 240
-
-
 def _limit_daily_forecast(
     payload: dict[str, object],
     days: int,
@@ -537,14 +386,8 @@ def _get_operation_name(path: str) -> str:
     """将内部请求路径映射为不含坐标的日志操作名称。"""
 
     # 第一步：仅按固定官方路径识别能力类型，日志中绝不保留动态坐标或查询参数。
-    if path == "/v7/weather/now":
-        return "current"
     if path.startswith("/v7/weather/") and path.endswith("d"):
         return "daily"
-    if path.startswith("/v7/weather/") and path.endswith("h"):
-        return "hourly"
-    if path == "/v7/warning/now":
-        return "alerts"
     return "unknown"
 
 
@@ -554,28 +397,10 @@ def _get_result_count(
 ) -> int | None:
     """提取天气响应中可用于维护日志的结果数量。"""
 
-    # 第一步：预报和预警结果按官方列表字段统计，避免打印完整数据正文。
-    list_field_by_operation = {
-        "daily": "days",
-        "hourly": "hours",
-        "alerts": "warning",
-    }
-    list_field = list_field_by_operation.get(operation)
-    if list_field is not None:
-        result = payload.get(list_field)
-        if result is None:
-            # 第二步：v7 使用 daily、hourly、warning，旧版测试桩使用 days、hours、alerts。
-            fallback_fields = {
-                "daily": "daily",
-                "hourly": "hourly",
-                "alerts": "alerts",
-            }
-            result = payload.get(fallback_fields.get(operation, ""))
-        return len(result) if isinstance(result, list) else 0
-    # 第二步：v7 实时天气使用 now，旧版测试桩使用 condition，均只记录是否有核心对象。
-    return (
-        1
-        if isinstance(payload.get("now"), dict)
-        or isinstance(payload.get("condition"), dict)
-        else 0
-    )
+    # 第一步：预报结果按官方列表字段统计，避免打印完整数据正文。
+    if operation != "daily":
+        return None
+    result = payload.get("days")
+    if result is None:
+        result = payload.get("daily")
+    return len(result) if isinstance(result, list) else 0

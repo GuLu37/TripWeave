@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     llm_provider: str = Field(default="deepseek", min_length=1)
     deepseek_api_key: str | None = None
     deepseek_base_url: str | None = None
-    deepseek_model: str | None = None
+    deepseek_model: str = Field(default="deepseek-v4-flash", min_length=1)
     # 审核总结使用独立 Pro 模型，避免入口与规划模型配置变化影响审批质量。
     deepseek_review_model: str = Field(default="deepseek-v4-pro", min_length=1)
     openai_api_key: str | None = None
@@ -39,12 +39,6 @@ class Settings(BaseSettings):
     qweather_api_host: str | None = None
     # API Key 仅由后端通过 X-QW-Api-Key 请求头发送，禁止暴露给浏览器。
     qweather_api_key: str | None = None
-    # Unsplash Access Key 仅由后端调用图片搜索接口，前端只接收图片和署名信息。
-    unsplash_access_key: str | None = None
-    unsplash_base_url: str = Field(
-        default="https://api.unsplash.com",
-        min_length=1,
-    )
     # LangGraph 会话检查点默认保存到 backend/data，便于本地重启后恢复会话。
     langgraph_checkpoint_path: str = Field(
         default="data/tripweave_checkpoints.sqlite",

@@ -11,6 +11,7 @@ from app.api.exception.exceptions import AppException
 from app.core.settings import get_settings
 from app.integrations.llm.client import chat_with_llm
 from app.integrations.llm.response_cleaner import extract_json_response
+from app.services.chat_progress import track_progress
 from app.schemas import (
     ClientChatMessage,
     ReviewResult,
@@ -76,29 +77,34 @@ async def review_trip(
         "validation_issues": [issue.model_dump() for issue in issues],
         "external_search_evidence": external_search_evidence or {},
     }
-    response_text = await chat_with_llm(
-        [
-            ClientChatMessage(
-                role="user",
-                content=json.dumps(
-                    context,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            )
-        ],
-        system_prompt=load_prompt("review_agent_prompt.md"),
-        response_validator=lambda response: _parse_review_result(response, status),
-        temperature=REVIEW_TEMPERATURE,
-        max_tokens=REVIEW_MAX_TOKENS,
-        max_attempts=REVIEW_MAX_ATTEMPTS,
-        json_mode=True,
-        # 第三步：审核固定使用 DeepSeek Pro；提示词仍要求内部核对，但关闭 API 思考以优先保证 JSON 正文。
-        provider_override="deepseek",
-        model_override=get_settings().deepseek_review_model,
-        disable_thinking=True,
-        caller_name="review_agent",
-    )
+    async with track_progress(
+        "审批 Agent",
+        "生成审核结论与待确认事项",
+        tool="审核总结",
+    ):
+        response_text = await chat_with_llm(
+            [
+                ClientChatMessage(
+                    role="user",
+                    content=json.dumps(
+                        context,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+            ],
+            system_prompt=load_prompt("review_agent_prompt.md"),
+            response_validator=lambda response: _parse_review_result(response, status),
+            temperature=REVIEW_TEMPERATURE,
+            max_tokens=REVIEW_MAX_TOKENS,
+            max_attempts=REVIEW_MAX_ATTEMPTS,
+            json_mode=True,
+            # 第三步：审核固定使用 DeepSeek Pro；提示词仍要求内部核对，但关闭 API 思考以优先保证 JSON 正文。
+            provider_override="deepseek",
+            model_override=get_settings().deepseek_review_model,
+            disable_thinking=True,
+            caller_name="review_agent",
+        )
 
     # 第四步：工作流状态由本地规则写入，模型只提供可读总结、风险和待确认事项。
     result = _parse_review_result(response_text, status)
