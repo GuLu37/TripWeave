@@ -1,318 +1,167 @@
-# TripWeave - 旅差智能助手
+# TripWeave
 
-> 当前文档按代码实际状态维护，最近核对日期：2026-08-16。
+> 面向个人与商务出行的对话式旅程规划助手。通过自然语言收集需求、并行获取目的地信息，并在用户确认路线后生成可执行的最终行程。
 
-## 1. 当前状态
+<p align="center">
+  <img src="./docs/images/tripweave-plan-demo.png" alt="TripWeave 待确认方案、路线规划与高德地图演示" width="49%" />
+  <img src="./docs/images/tripweave-agent-progress-demo.png" alt="TripWeave 助手处理过程和并行 Agent 进度演示" width="49%" />
+</p>
 
-TripWeave 当前是一个以对话为入口的旅差规划 Demo：
+## 项目简介
 
-- 前端使用 React、TypeScript 和 Vite，提供聊天窗口、失败重试和旅差需求快捷补充面板。
-- 后端使用 FastAPI，入口为 `POST /api/v1/chat/messages`。
-- 后端使用 LangGraph 编排意图判断、需求分析、规划、工具查询、规则校验、审核和确认流程。
-- 大模型客户端使用 OpenAI 兼容协议，当前可配置 DeepSeek、OpenAI 和第三方代理供应商。
-- 通过 `conversation_id` 关联 LangGraph `thread_id`，工作流状态由 SQLite Checkpointer 持久化。
-- 服务端 SQLite Checkpointer 保存会话历史；浏览器回传的本地上下文窗口只作为兼容输入。
-- 高德和风天气能力通过后端 Tools 调用；酒店和城际交通当前使用本地估算 Tools，不代表实时价格、库存或余票。
-- 用户确认方案后，后端补充高德地图距离和按路线规划顺序排列的城市内路线摘要，并通过 `confirmed_plan.details` 返回前端。
-- 当前只生成推荐方案，不执行真实购票、订房或支付。
+TripWeave 将“聊天理解需求”和“可确认的路线方案”放在同一个工作台中：
 
-当前默认可以只配置 DeepSeek。未配置的备用供应商会被跳过；所有供应商都不可用时，接口会返回统一业务错误。
+- 用户可直接描述出发地、目的地、日期、人数、预算和偏好，也可用右侧表单快速补齐。
+- 系统先识别本轮意图：普通聊天、完整旅程规划、酒店查询或城际交通查询。
+- 完整需求会进入 LangGraph 工作流，由规划 Agent 分派三个并行子 Agent 收集目的地、住宿与城际交通信息。
+- 规划草案需经过确定性规则校验和审批 Agent 审核；不通过时会复用原进度项回流重规划。
+- 待确认方案支持拖动景点、美食卡片调整路线顺序，并同步更新地图和城市内路线。
+- 用户确认后，系统按确认路线重写最终行程，展示出发地至目的地概览、城市内导航摘要和天气信息。
 
-## 2. 当前运行流程
+TripWeave 只提供行程决策参考，不创建订单，也不执行购票、订房或支付。酒店与城际交通当前为估算参考，不代表实时价格、库存、余票或可预订状态。
 
-### 2.1 主流程
+## 功能一览
+
+| 能力 | 说明 |
+| --- | --- |
+| 对话式需求收集 | 识别出发地、目的地、出发日期、返程/时长、人数、预算与出行偏好；缺少关键字段时只追问最小必要信息。 |
+| 普通闲聊 | 无旅行意图时由 LLM 自然回复，不强制进入行程规划。 |
+| 直接查询 | 酒店与飞机/火车查询走轻量分支，不触发完整旅程规划。 |
+| 并行旅程取证 | 规划 Agent 并行调度执行 Agent、住宿查询 Agent、城际交通查询 Agent。 |
+| 可视化处理进度 | 前端按后端真实执行事件展示 Agent、工具、父子关系、完成、失败和不可用状态。 |
+| 方案审核与回流 | 本地规则决定审核状态；可自动修复的问题会回流规划 Agent，无法安全修复的问题交由用户决策。 |
+| 路线规划 | 待确认方案可拖动景点/美食卡片；高德地图路线与城市内交通顺序随之更新。 |
+| 确认后重写 | 确认路线后生成面向用户的最终文本计划，去除工具调用和模型格式噪声。 |
+| 方案归档 | 当前对话的待确认、已确认方案会显示在右侧列表；已确认方案可调用浏览器打印并保存为 PDF。 |
+| 会话恢复 | LangGraph SQLite Checkpointer 按 `conversation_id` 保存服务端上下文与工作流状态。 |
+
+## 工作流
 
 ```mermaid
 flowchart TD
-    A["用户消息"] --> B["POST /api/v1/chat/messages"]
-    B --> C["合并服务端历史、客户端窗口与需求快照"]
-    C --> D["LangGraph"]
-    D --> E["意图判断 Agent"]
-    E -- "chat" --> F["直接返回聊天回复"]
-    E -- "trip_planning" --> G["需求分析 Agent"]
-    G --> H{"需求完整？"}
-    H -- "否" --> I["返回一个关键追问"]
-    I --> A
-    H -- "是" --> J["规划 Agent"]
-    J --> K["并行收集高德、天气和本地路线证据"]
-    K --> L["生成旅差方案草案"]
-    L --> M["Rule Validation"]
-    M --> N["审核总结 Agent"]
-    N --> O{"审核状态"}
-    O -- "ready_for_confirmation" --> P["返回待确认方案"]
-    O -- "needs_replanning" --> Q{"重规划次数 < 2？"}
-    Q -- "是" --> R["压缩审核反馈"]
-    R --> J
-    Q -- "否" --> S["返回风险与待用户决策项"]
-    O -- "needs_user_decision" --> S
-    P --> T{"用户下一轮动作"}
-    T -- "修改" --> G
-    T -- "确认" --> U["生成 ConfirmedTripPlan"]
-    U --> V["高德地图与城市内路线取证"]
-    V --> W["前端展示完整确认方案"]
+    A["用户消息"] --> B["入口 Agent：识别意图"]
+    B -->|"普通聊天"| C["LLM 回复"]
+    B -->|"酒店 / 城际交通查询"| D["查询需求分析"]
+    D --> E["直接查询并返回参考结果"]
+    B -->|"旅程规划 / 修改"| F["需求分析 Agent"]
+    F -->|"信息不完整"| G["追问缺失字段"]
+    F -->|"信息完整"| H["规划 Agent：拆分任务"]
+    H --> I["执行 Agent：地点、天气、本地交通"]
+    H --> J["住宿查询 Agent：价格与房型参考"]
+    H --> K["城际交通查询 Agent：飞机、高铁参考"]
+    I --> L["规划 Agent：合并证据并生成草案"]
+    J --> L
+    K --> L
+    L --> M["审批 Agent：规则校验与审核总结"]
+    M -->|"需重规划"| H
+    M -->|"可确认 / 用户决策"| N["发布待确认方案"]
+    N --> O["用户调整路线或确认"]
+    O -->|"确认"| P["审批 Agent：补充路线并重写最终方案"]
 ```
 
-### 2.2 直接查询分支
+### Agent 职责
 
-统一入口还支持两个不进入完整行程规划的查询意图：
+| Agent / 节点 | 职责 |
+| --- | --- |
+| 入口 Agent | 判断聊天、旅程规划、酒店查询、城际交通查询及确认/修改动作。 |
+| 需求分析 Agent | 合并上下文与结构化需求，规范化日期、时长和人数，并计算真实缺失字段。 |
+| 规划 Agent | 分派并合并并行取证结果，生成或重生成旅程草案。 |
+| 执行 Agent | 查询目的地 POI、天气和本地交通证据。 |
+| 住宿查询 Agent | 生成酒店价格、房型和库存估算参考。 |
+| 城际交通查询 Agent | 生成飞机和高铁班次、价格估算参考。 |
+| 审批 Agent | 执行规则校验、生成审核结论，并在确认后补充路线信息和最终文本。 |
 
-```mermaid
-flowchart LR
-    A["用户消息"] --> B["意图判断 Agent"]
-    B -- "accommodation_search" --> C["直接查询需求分析"]
-    C --> D["住宿查询 Agent"]
-    B -- "intercity_transport_search" --> E["直接查询需求分析"]
-    E --> F["城际交通查询 Agent"]
-    D --> G["返回酒店查询结果"]
-    F --> H["返回飞机/火车查询结果"]
-```
+## 技术栈
 
-直接查询字段不足时，系统只追问查询所需的最小字段。查询失败会返回明确的不可用状态，不会伪装成实时结果。
+- 前端：React 19、TypeScript、Vite
+- 后端：FastAPI、Pydantic、Uvicorn
+- 工作流：LangGraph、SQLite Checkpointer、aiosqlite
+- LLM：OpenAI 兼容接口；默认支持 DeepSeek，并可配置 OpenAI 或兼容代理作为备用供应商
+- 地图：高德 Web 服务 API、前端高德 Web JS API
+- 天气：和风天气 API
 
-## 3. Agent 与工作流职责
-
-| 组件 | 当前职责 | 当前状态 |
-| --- | --- | --- |
-| 意图判断 Agent | 区分普通聊天、旅差规划、酒店查询、城际交通查询，并识别确认或修改动作 | 已实现 |
-| 需求分析 Agent | 提取并合并 `TripRequirements`，补充日期和时长归一化，按本地规则计算缺失字段 | 已实现 |
-| 规划 Agent | 收集可信工具证据，再由模型生成 Markdown 方案草案；支持审核反馈和用户修改触发的重规划 | 已实现 |
-| 住宿查询 Agent | 通过本地酒店估算 Tool 生成价格、房型和库存参考 | 已实现 |
-| 城际交通查询 Agent | 通过本地交通估算 Tool 生成飞机和火车班次参考 | 已实现 |
-| 审核总结 Agent | 根据方案、规则校验和工具证据生成总结、风险和待确认项；状态仍由本地规则决定 | 已实现 |
-| 会话历史策略 | Checkpointer 保存最多 120 条；模型每次读取最近 8 条和其外 6 条历史，不调用摘要 Agent | 已实现 |
-| 用户确认 | 由 LangGraph 节点处理，确认后生成带高德地图和路线详情的 `ConfirmedTripPlan` | 已实现 |
-
-吃、住、行、景点和天气不再拆成独立业务 Agent。规划取证层通过 Tools 调用这些能力，减少多 Agent 转发和自由文本传递。
-
-### 3.1 规划 Agent 的实际调用方式
-
-当前规划 Agent 不是模型原生 `tool_calls` 自主循环，而是由后端代码先完成取证，再把压缩后的证据交给模型生成方案：
-
-1. 校验需求完整性。
-2. 调用地图地理编码获取目的地坐标。
-3. 并发查询住宿、景点和餐饮 POI。
-4. 按候选地点计算少量本地交通路线。
-5. 在出发日期落入未来十天窗口时查询天气；超出窗口则明确标记为不可用或跳过。
-6. 将需求、工具证据和有限的重规划反馈交给规划模型。
-7. 生成非空 Markdown 方案草案。
-
-因此，当前 Tools 是后端规划取证层的可靠数据源，规划模型负责解释和编排，不直接控制外部 API 或浏览器。
-
-## 4. 核心契约
-
-### 4.1 `ConversationAnalysis`
+## 目录结构
 
 ```text
-intent:
-  chat
-  trip_planning
-  accommodation_search
-  intercity_transport_search
-reply: str
-requirements: TripRequirements | null
-plan_action: plan | modify | confirm | null
-pending_plan: TripPlanSnapshot | null
-confirmed_plan: ConfirmedTripPlan | null
-missing_fields: list[str]
-is_complete: bool | null
+TripWeave/
+├── docs/
+│   └── images/                         # GitHub README 演示截图
+├── backend/
+│   ├── .env.example                    # 后端环境变量模板
+│   ├── requirements.txt
+│   ├── app/
+│   │   ├── api/                        # 聊天、进度和健康检查接口
+│   │   ├── agents/                     # 入口、规划、执行、查询、审批 Agent
+│   │   ├── core/                       # 配置、日志、旅行时长工具
+│   │   ├── integrations/llm/           # OpenAI 兼容模型客户端与响应清洗
+│   │   ├── services/                   # 处理进度、确认方案路线服务
+│   │   ├── tools/                      # 高德、天气、POI、酒店和交通工具
+│   │   ├── workflows/                  # LangGraph 编排
+│   │   ├── main.py                     # FastAPI 应用入口
+│   │   └── schemas.py                  # API 与工作流数据契约
+│   └── tests/
+├── frontend/
+│   ├── .env.example                    # 前端地图配置模板
+│   ├── src/
+│   │   ├── App.tsx                     # 对话工作台和地图交互
+│   │   └── styles.css
+│   └── package.json
+└── README.md
 ```
 
-普通聊天不能携带 `requirements`。旅差规划和直接查询意图必须携带结构化需求对象。`missing_fields` 和 `is_complete` 由后端本地规则计算，不能仅信任模型自行判断。
+## 快速开始
 
-### 4.2 `TripRequirements`
+### 1. 准备后端
 
-```text
-origin: str | null
-destination: str | null
-departure_date: str | null
-return_date: str | null
-trip_duration: TripDuration | null
-traveler_count: int | null
-budget: str | null
-transport_preferences: list[str]
-accommodation_preferences: list[str]
-dining_preferences: list[str]
-attraction_preferences: list[str]
-general_preferences: list[str]
-fixed_schedule: list[str]
-```
-
-进入完整旅差规划的最低字段为：
-
-- `destination`
-- `departure_date`
-- `return_date` 或 `trip_duration`
-- `traveler_count`
-
-### 4.3 旅行时长
-
-旅行时长保留用户原始表达，并使用结构化单位：
-
-```json
-{
-  "raw_text": "一周",
-  "amount": 1,
-  "unit": "week",
-  "is_approximate": false
-}
-```
-
-`unit` 只能是 `hour`、`day`、`week` 或 `month`。例如：
-
-- “半天”表示 `0.5 + day`
-- “三天”表示 `3 + day`
-- “一周”表示 `1 + week`
-- “一个月”表示 `1 + month`
-
-周和月不会在需求分析阶段强行折算成固定天数；在已有出发日期时，规划层再按日历语义计算。无法可靠识别的相对日期会保留原文，不会编造具体日期。
-
-### 4.4 方案确认状态
-
-`ReviewResult.status` 由本地规则计算：
-
-| 状态 | 含义 |
-| --- | --- |
-| `ready_for_confirmation` | 没有阻断性硬错误，返回待用户确认方案 |
-| `needs_replanning` | 存在可自动修复的问题，最多自动重规划 2 次 |
-| `needs_user_decision` | 存在无法由系统安全修复的问题，返回风险和待用户决策项 |
-
-模型只负责生成审核摘要、风险和待确认项，不能自行修改审核状态或绕过硬约束。
-
-确认成功后，`ConversationAnalysis.confirmed_plan` 会额外包含：
-
-- `details.routes`：按路线规划中景点/美食顺序生成的相邻地点公交、步行和驾车路线摘要。
-- `details.tool_status`：`available`、`unavailable` 或 `skipped`，第三方不可用时不阻断确认。
-
-## 5. 记忆与请求状态
-
-当前没有业务数据库、Redis 或独立长期记忆服务。系统分为两层状态：
-
-- LangGraph 工作流状态和会话历史：由服务端 SQLite Checkpointer 持久化。
-- 浏览器兼容窗口：由前端回传最近 8 条消息。
-
-前端保存并回传：
-
-- `short_term_memory`：最近 8 条消息；`summary` 仅为旧客户端兼容字段。
-- `conversation_id`：服务端创建的会话 ID，后续请求必须保持不变。
-
-`known_requirements` 和 `pending_plan` 仍被后端接受，用于兼容旧客户端；当前前端不再依赖它们作为恢复待确认方案的唯一来源。
-
-后端每轮会：
-
-1. 根据 `conversation_id` 从 Checkpointer 读取服务端历史。
-2. 将服务端历史和本轮客户端消息按重叠后缀合并，避免重复。
-3. 服务端最多保留 120 条消息，并将本轮助手回复写回 Checkpointer。
-4. 入口 Agent 每次把最近 8 条消息完整传给模型，再附加其外 6 条较早历史；较早助手长回复会截短。
-5. 结构化 `TripRequirements`、`pending_plan` 和 `review_result` 作为稳定业务记忆，不依赖自然语言历史猜测。
-
-完整方案不依赖助手长文本记忆保存，而是由 Checkpointer 按 `conversation_id` 保存。服务重启后，使用同一会话 ID 可以恢复待确认方案、审核状态和历史消息。
-
-### 5.1 成本控制策略
-
-- 纯问候、明确人数/日期/时长补充、明确酒店或交通查询等确定性意图优先由本地规则处理，跳过一次意图判断 LLM。
-- 需求分析 Agent 仍保留，用于理解预算、偏好、纠错和自然语言字段合并。
-- 规划 Agent 仍保留，用于根据 Tools 证据生成完整方案。
-- 审核总结 Agent 保留，用于整理方案风险和用户可读结论；审核状态由本地规则校验，模型不能越权改变分支。
-- `accommodation_search_agent.py` 和 `intercity_transport_search_agent.py` 当前只是查询适配器，不调用 LLM；后续可在目录清理时改名为 service，但不会产生模型成本。
-
-### 5.2 Checkpointer 生命周期
-
-- 首次请求未携带 `conversation_id` 时，后端生成 UUID。
-- 后续请求将该 UUID 作为 LangGraph 的 `thread_id`。
-- 默认检查点文件为 `backend/data/tripweave_checkpoints.sqlite`。
-- FastAPI 启动时打开 SQLite 连接并初始化表结构，关闭时释放连接。
-- 当前审批等待仍以 `await_confirmation` 节点结束本轮请求；下一轮使用同一会话 ID恢复状态。后续如需真正的 `interrupt()` 恢复协议，可在此基础上扩展。
-
-## 6. Tools 与外部集成
-
-### 6.1 本地 Tools
-
-| 文件 | 能力 |
-| --- | --- |
-| `backend/app/tools/map_route_tool.py` | 高德地理编码、POI、步行/公交/驾车/骑行路线 |
-| `backend/app/tools/poi_search.py` | 城市和周边 POI 查询公共封装 |
-| `backend/app/tools/accommodation_tool.py` | 住宿 POI 查询，不代表真实价格或库存 |
-| `backend/app/tools/attraction_tool.py` | 景点 POI 查询，不代表门票或开放状态 |
-| `backend/app/tools/food_tool.py` | 餐饮 POI 查询，不代表评分或营业状态 |
-| `backend/app/tools/hotel_search_tool.py` | 本地酒店价格估算，不访问实时 API |
-| `backend/app/tools/traffic_search_tool.py` | 本地飞机/高铁价格估算，不代表实时票价或余票 |
-| `backend/app/tools/transport_tool.py` | 本地交通方式规划和不可用方式收敛 |
-| `backend/app/tools/weather_tool.py` | 和风天气实时天气、逐日/逐小时预报和预警 |
-
-### 6.2 确认方案服务
-
-| 文件 | 能力 |
-| --- | --- |
-| `backend/app/services/confirmed_trip_service.py` | 确认后收集高德地图和城市内路线，统一降级为可展示状态 |
-
-### 6.3 LLM 集成
-
-`backend/app/integrations/llm/` 负责：
-
-- 主供应商和备用供应商路由。
-- 当前供应商内重试。
-- OpenAI 兼容请求封装。
-- JSON 响应清洗和结构化契约校验。
-- 原始请求/响应调试日志开关。
-- 日志脱敏。
-
-`response_cleaner.py` 会处理 BOM、零宽字符、不换行空格、首尾空白、Markdown JSON 代码围栏和 JSON 前置说明，但不会猜测性修复任意业务字段。
-
-## 7. 启动
-
-### 7.1 后端
-
-在 `backend` 目录创建 `.env`：
+进入后端目录，复制环境变量模板：
 
 ```powershell
 cd backend
 Copy-Item .env.example .env
 ```
 
-至少配置一个模型：
+至少配置一个 LLM 供应商。以 DeepSeek 为例：
 
 ```dotenv
 LLM_PROVIDER=deepseek
-DEEPSEEK_API_KEY=你的密钥
+DEEPSEEK_API_KEY=your_api_key
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_REVIEW_MODEL=deepseek-v4-pro
 ```
 
-创建环境并启动：
+创建 Python 环境并启动服务：
 
 ```powershell
-cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-后端地址默认是 `http://127.0.0.1:8000`，健康检查：
+后端默认运行在 `http://127.0.0.1:8000`，可用以下地址检查服务：
 
 ```text
 http://127.0.0.1:8000/api/v1/health
 ```
 
-也支持：
+### 2. 准备前端
 
-```powershell
-python -m app.main
-```
-
-### 7.2 前端
+另开一个终端：
 
 ```powershell
 cd frontend
 npm install
+Copy-Item .env.example .env.local
 npm run dev
 ```
 
-前端默认地址为 `http://localhost:5173`。如后端地址不同，可设置：
+前端默认运行在 `http://127.0.0.1:5173`。
 
-```powershell
-$env:VITE_API_BASE_URL="http://127.0.0.1:8000"
-npm run dev
+若后端不在默认地址，可在 `frontend/.env.local` 中配置：
+
+```dotenv
+VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
 
 生产构建：
@@ -321,61 +170,60 @@ npm run dev
 npm run build
 ```
 
-## 8. 配置
+## 配置说明
 
-完整模板位于 `backend/.env.example`。常用配置如下：
+### LLM
 
-| 变量 | 默认值 | 作用 |
+后端从 `backend/.env` 读取模型设置：
+
+| 变量 | 说明 |
+| --- | --- |
+| `LLM_PROVIDER` | 主供应商：`deepseek`、`openai` 或 `proxy`。 |
+| `LLM_FALLBACK_PROVIDERS` | 备用供应商列表，逗号分隔；只会调用已完整配置的供应商。 |
+| `LLM_MAX_RETRIES` | 单一供应商发生可恢复错误时的最大尝试次数。 |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | 常规 Agent 使用的 DeepSeek 配置。 |
+| `DEEPSEEK_REVIEW_MODEL` | 审批 Agent 使用的 DeepSeek Pro 模型。 |
+| `OPENAI_*` | OpenAI 兼容配置。 |
+| `PROXY_*` | 第三方 OpenAI 兼容代理配置。 |
+
+### 地图与天气
+
+| 变量 | 位置 | 说明 |
 | --- | --- | --- |
-| `LLM_PROVIDER` | `deepseek` | 主模型供应商：`deepseek`、`openai` 或 `proxy` |
-| `LLM_FALLBACK_PROVIDERS` | 空或按模板配置 | 备用供应商顺序，仅已配置供应商会调用 |
-| `LLM_MAX_RETRIES` | `3` | 单供应商可恢复错误的最大尝试次数 |
-| `LLM_DEBUG_LOG_RAW_OUTPUT` | `false` | 契约失败时记录脱敏后的模型原始响应 |
-| `LLM_DEBUG_LOG_RAW_REQUEST` | `false` | 契约失败时记录 Agent 请求上下文和生成参数 |
-| `DEEPSEEK_API_KEY` | - | DeepSeek API Key |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek 基础地址 |
-| `DEEPSEEK_MODEL` | - | 普通 Agent 使用的 DeepSeek 模型 |
-| `DEEPSEEK_REVIEW_MODEL` | `deepseek-v4-pro` | 审核总结 Agent 使用的模型 |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | - | OpenAI 配置 |
-| `PROXY_API_KEY` / `PROXY_BASE_URL` / `PROXY_MODEL` | - | OpenAI 兼容中转站配置 |
-| `AMAP_WEB_SERVICE_KEY` | - | 高德 Web 服务 Key |
-| `AMAP_WEB_SERVICE_BASE_URL` | `https://restapi.amap.com` | 高德服务地址 |
-| `QWEATHER_API_HOST` | - | 和风天气控制台分配的专属 Host |
-| `QWEATHER_API_KEY` | - | 和风天气服务端 Key |
-| `LANGGRAPH_CHECKPOINT_PATH` | `data/tripweave_checkpoints.sqlite` | LangGraph SQLite 检查点文件，相对 `backend` 目录 |
-| `CORS_ALLOW_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | 允许访问后端的前端地址 |
-| `LOG_MAX_BYTES` | `1048576` | 单个日志文件最大字节数 |
-| `LOG_BACKUP_COUNT` | `5` | 日志滚动保留数量 |
+| `AMAP_WEB_SERVICE_KEY` | `backend/.env` | 后端地理编码、POI 与路径规划。 |
+| `AMAP_WEB_SERVICE_BASE_URL` | `backend/.env` | 高德 Web 服务地址，通常无需修改。 |
+| `VITE_AMAP_WEB_JS_KEY` | `frontend/.env.local` | 浏览器渲染最终方案实时地图。 |
+| `VITE_AMAP_SECURITY_CODE` | `frontend/.env.local` | 高德 Web JS API 配置安全密钥时使用。 |
+| `QWEATHER_API_HOST` | `backend/.env` | 和风天气控制台分配的专属 API Host。 |
+| `QWEATHER_API_KEY` | `backend/.env` | 和风天气服务端密钥。 |
 
-日志默认写入 `backend/app/logs/`，文件名包含启动时间。正常日志只记录请求 ID、调用阶段、耗时、结果形态、数量和错误摘要，不记录密钥。
+地图或天气未配置时，相关能力会降级为不可用或跳过，不应阻断对话、草案或方案确认。
 
-调试模型契约时可以临时开启：
+### 运行与数据
 
-```dotenv
-LLM_DEBUG_LOG_RAW_OUTPUT=true
-LLM_DEBUG_LOG_RAW_REQUEST=true
-```
+| 变量 | 说明 |
+| --- | --- |
+| `LANGGRAPH_CHECKPOINT_PATH` | LangGraph SQLite 检查点文件，默认 `backend/data/tripweave_checkpoints.sqlite`。 |
+| `CORS_ALLOW_ORIGINS` | 允许访问 API 的前端地址，多个地址以英文逗号分隔。 |
+| `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` | 后端日志滚动策略。 |
+| `LLM_DEBUG_LOG_RAW_OUTPUT` / `LLM_DEBUG_LOG_RAW_REQUEST` | 调试模型契约时输出脱敏后的原始内容；仅限本地、受控环境短时开启。 |
 
-这两个开关可能记录对话内容，只能在本地或受控环境使用，排障完成后应关闭并重启后端。
+## API
 
-## 9. API
+### `POST /api/v1/chat/messages`
 
-### 9.1 已实现接口
+提交本轮消息，返回统一意图分析、结构化需求、待确认/已确认方案、执行进度和兼容上下文窗口。
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `POST` | `/api/v1/chat/messages` | 提交本轮消息并返回 `analysis` 与 `short_term_memory` |
-| `GET` | `/api/v1/health` | 服务健康检查 |
-
-### 9.2 请求示例
+请求示例：
 
 ```json
 {
   "conversation_id": null,
+  "client_request_id": null,
   "messages": [
     {
       "role": "user",
-      "content": "下个月从广州去北京玩一周，一共五个人"
+      "content": "下周从上海去杭州出差两天，2 人同行"
     }
   ],
   "short_term_memory": null,
@@ -384,169 +232,65 @@ LLM_DEBUG_LOG_RAW_REQUEST=true
 }
 ```
 
-前端实际使用时通常只提交当前用户消息，并回传上一轮返回的 `conversation_id` 和 `short_term_memory`。旧客户端仍可额外提交 `known_requirements` 和 `pending_plan`。
+关键返回字段：
 
-### 9.3 响应示例
+| 字段 | 说明 |
+| --- | --- |
+| `conversation_id` | 后续请求需回传的会话 ID，也是 LangGraph `thread_id`。 |
+| `analysis.intent` | `chat`、`trip_planning`、`accommodation_search` 或 `intercity_transport_search`。 |
+| `analysis.reply` | 可直接展示给用户的回复。 |
+| `analysis.requirements` | 解析后的旅程或查询需求。 |
+| `analysis.pending_plan` | 待确认的规划草案、审核结果、地图点位和路线信息。 |
+| `analysis.confirmed_plan` | 用户确认后生成的最终方案。 |
+| `analysis.search_results` | 酒店或城际交通的结构化参考结果。 |
+| `progress_events` | 本轮实际 Agent 与工具执行进度。 |
 
-```json
-{
-  "conversation_id": "00000000-0000-4000-8000-000000000001",
-  "analysis": {
-    "intent": "trip_planning",
-    "reply": "请问您计划哪天出发？",
-    "requirements": {
-      "origin": "广州",
-      "destination": "北京",
-      "departure_date": null,
-      "return_date": null,
-      "trip_duration": {
-        "raw_text": "一周",
-        "amount": 1,
-        "unit": "week",
-        "is_approximate": false
-      },
-      "traveler_count": 5,
-      "budget": null,
-      "transport_preferences": [],
-      "accommodation_preferences": [],
-      "dining_preferences": [],
-      "attraction_preferences": [],
-      "general_preferences": [],
-      "fixed_schedule": []
-    },
-    "plan_action": "plan",
-    "pending_plan": null,
-    "confirmed_plan": null,
-    "missing_fields": ["departure_date"],
-    "is_complete": false
-  },
-  "short_term_memory": {
-    "summary": null,
-    "recent_messages": [
-      {
-        "role": "user",
-        "content": "下个月从广州去北京玩一周，一共五个人"
-      },
-      {
-        "role": "assistant",
-        "content": "请问您计划哪天出发？"
-      }
-    ]
-  }
-}
-```
+### `GET /api/v1/chat/progress/{client_request_id}`
 
-实际字段以 `backend/app/schemas.py` 为准。业务异常统一由后端错误处理器返回，模型供应商全部不可用时错误码为 `LLM_FALLBACK_EXHAUSTED`。
+前端轮询本轮真实执行状态。事件会携带 Agent 名称、动作、工具名称、父事件、状态和失败原因，不包含模型思考正文。
 
-## 10. 项目结构
+### `GET /api/v1/health`
 
-```text
-TripWeave/
-├── README.md
-├── AGENT.md
-├── .env.example
-├── backend/
-│   ├── .env.example
-│   ├── requirements.txt
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── schemas.py
-│   │   ├── api/
-│   │   │   ├── exception/
-│   │   │   └── router/
-│   │   │       ├── chat.py
-│   │   │       └── health.py
-│   │   ├── agents/
-│   │   │   ├── conversation_entry_agent.py
-│   │   │   ├── planning_agent.py
-│   │   │   ├── planning_evidence.py
-│   │   │   ├── review_agent.py
-│   │   │   ├── accommodation_search_agent.py
-│   │   │   ├── intercity_transport_search_agent.py
-│   │   │   ├── prompts/
-│   │   │   └── skills/
-│   │   │       └── trip-planning/
-│   │   ├── core/
-│   │   │   ├── settings.py
-│   │   │   ├── logging.py
-│   │   │   └── trip_duration.py
-│   │   ├── memory/
-│   │   │   └── short_term_memory.py
-│   │   ├── tools/
-│   │   │   ├── map_route_tool.py
-│   │   │   ├── poi_search.py
-│   │   │   ├── accommodation_tool.py
-│   │   │   ├── attraction_tool.py
-│   │   │   ├── food_tool.py
-│   │   │   ├── hotel_search_tool.py
-│   │   │   ├── traffic_search_tool.py
-│   │   │   ├── transport_tool.py
-│   │   │   └── weather_tool.py
-│   │   ├── services/
-│   │   │   └── confirmed_trip_service.py
-│   │   ├── integrations/
-│   │   │   └── llm/
-│   │   ├── workflows/
-│   │   │   └── trip_conversation_graph.py
-│   │   └── logs/
-│   └── tests/
-└── frontend/
-    ├── package.json
-    └── src/
-        ├── App.tsx
-        ├── main.tsx
-        └── styles.css
-```
+返回 API 服务状态与版本。
 
-`__pycache__`、测试缓存、前端 `node_modules` 和运行日志属于本地生成物，不是业务源代码。
+## 状态与数据边界
 
-## 11. 测试与验证
+- `conversation_id` 用于恢复服务端的工作流状态；更换 ID 即视为新会话。
+- SQLite Checkpointer 保存会话消息、需求快照、待确认方案和工作流检查点。开发时不要在服务运行中手动删除 `.sqlite-wal` 或 `.sqlite-shm` 文件。
+- 浏览器仅保留有限的兼容上下文窗口，完整状态以服务端 Checkpointer 为准。
+- 一次助手回复最多携带一个新生成的待确认方案；历史方案在当前对话中保留，并显示在右侧方案列表。
+- 方案确认只生成最终行程文本和路线参考，不会产生任何第三方订单。
 
-后端测试使用 Python 标准库 `unittest`，从 `backend` 目录运行：
+## 验证
+
+后端测试位于 `backend/tests/`。安装测试工具后可执行：
 
 ```powershell
 cd backend
-python -m unittest discover -s tests -p "test_*.py" -v
+python -m pytest tests -q
 ```
 
-也可以进行 Python 编译检查：
-
-```powershell
-python -m compileall -q app tests
-```
-
-前端构建检查：
+前端类型检查和生产构建：
 
 ```powershell
 cd frontend
 npm run build
 ```
 
-测试目录用于覆盖入口 Agent、LangGraph 直接查询分支、短期记忆、规划 Agent、审核 Agent、日志与异常处理以及各类工具。当前工作区测试源码未完整保留，恢复测试文件后再执行上述完整测试命令。
+## 当前限制
 
-## 12. 当前边界与后续计划
+- 酒店、飞机和火车结果目前为本地估算参考，未接入实时价格、库存、余票或预订 API。
+- 高德和和风天气依赖相应的 API Key、网络和第三方服务可用性。
+- 会话状态保存在本地 SQLite，适合本地开发和 Demo；生产环境应增加身份认证、备份、清理策略及更合适的持久化方案。
+- 当前不包含支付、购票、订房、企业审批、订单管理或跨设备账户体系。
 
-### 当前未实现
+## 安全建议
 
-- 业务数据库、Redis、长期记忆和带身份认证的跨设备会话。
-- `/api/v1/trips` 计划 CRUD、重规划和确认接口。
-- 真实订单创建、支付、购票和订房。
-- 稳定的实时票价、库存和第三方预订 API。
-- Docker Compose、端到端浏览器测试和生产部署配置。
-- 模型原生自主 Tool Calls 循环。
+- 不要提交 `backend/.env`、`frontend/.env.local` 或任何真实 API Key。
+- 原始 LLM 请求/响应调试日志可能包含对话内容，排障结束后应立即关闭调试开关。
+- 对外部署时请收紧 `CORS_ALLOW_ORIGINS`，并为 API 增加鉴权、限流与审计。
 
-### 后续建议
+## 版权
 
-1. 先补充真实外部数据源的契约测试和观测指标。
-2. 再把当前浏览器快照和前端状态迁移到服务端会话存储。
-3. 增加独立的行程方案接口，降低聊天接口承载的状态复杂度。
-4. 在需求和工具契约稳定后，再评估是否需要把规划取证改造成模型原生 Tool Calls。
-5. 最后接入长期记忆、企业差旅规则、订单和审批系统。
-
-## 13. 安全与数据要求
-
-- API Key 和第三方密钥只能通过环境变量提供，禁止提交真实密钥。
-- 模型原始请求和响应调试日志默认关闭，开启后只在受控环境短时使用。
-- 工具调用必须设置超时、结果长度限制和失败降级。
-- 外部查询结果必须标注估算或快照性质，不能把候选 POI、价格、库存和余票伪装成已确认订单。
-- 模型输出必须先经过 JSON 清洗、Pydantic 契约校验和本地规则校验，再进入工作流或前端展示。
+TripWeave 旅程智能助手 v1.0.0<br>
+版权归属 [GuLu37](https://github.com/GuLu37)
