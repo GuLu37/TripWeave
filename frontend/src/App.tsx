@@ -177,7 +177,7 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000
 const TRANSPORT_OPTIONS = ["高铁", "飞机", "自驾"];
 const INTEREST_OPTIONS = ["人文历史", "亲子", "美食", "自然风光"];
 const STARTER_PROMPTS = [
-  "下周从上海去杭州出差两天，2 人同行",
+  "下周一从上海去杭州出差三天，2人同行",
   "查一下北京国贸附近适合商务出行的酒店",
   "帮我看看广州到深圳下周五的高铁",
 ];
@@ -1354,6 +1354,8 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const nextMessageId = useRef(0);
   const liveProgressEventsRef = useRef<ChatProgressEvent[]>([]);
+  const activeRequestControllerRef = useRef<AbortController | null>(null);
+  const sessionVersionRef = useRef(0);
   const failedMessage = messages.find((message) => message.delivery === "failed");
   const activeRequirements = analysis?.requirements ?? tripContext?.requirements ?? null;
   const missingFields = useMemo(() => new Set(analysis?.missing_fields ?? []), [analysis]);
@@ -1378,12 +1380,21 @@ function App() {
     pendingMessageId: number,
     options: { pendingPlan?: TripPlanSnapshot } = {},
   ) {
+    const sessionVersion = sessionVersionRef.current;
+    const requestController = new AbortController();
+    activeRequestControllerRef.current?.abort();
+    activeRequestControllerRef.current = requestController;
+    const isCurrentRequest = () => (
+      sessionVersionRef.current === sessionVersion
+      && activeRequestControllerRef.current === requestController
+    );
     setError("");
     setIsSending(true);
     const clientRequestId = crypto.randomUUID();
     let isPolling = true;
     let progressTimer: number | undefined;
     const updateProgressEvents = (events: ChatProgressEvent[]) => {
+      if (!isCurrentRequest()) return;
       liveProgressEventsRef.current = events;
       setLiveProgressEvents(events);
     };
@@ -1392,7 +1403,7 @@ function App() {
         const progressResponse = await fetch(`${API_BASE_URL}/api/v1/chat/progress/${clientRequestId}`);
         if (!progressResponse.ok) return;
         const progress = await progressResponse.json() as ChatProgressResponse;
-        if (isPolling && progress.found) updateProgressEvents(progress.events);
+        if (isPolling && isCurrentRequest() && progress.found) updateProgressEvents(progress.events);
       } catch {
         // 进度接口不可用时保留中性等待状态，不能伪造 Agent 执行过程。
       }
@@ -1421,6 +1432,7 @@ function App() {
           known_requirements: knownRequirements,
           pending_plan: options.pendingPlan ?? undefined,
         }),
+        signal: requestController.signal,
       });
       const data = await response.json().catch(() => null) as ChatApiResponse | ChatApiError | null;
       if (!response.ok) {
@@ -1431,6 +1443,7 @@ function App() {
         throw new Error("对话服务返回的数据不完整。");
       }
       await pollProgress();
+      if (!isCurrentRequest()) return;
       isPolling = false;
       const finalProgressEvents = data.progress_events ?? liveProgressEventsRef.current;
       updateProgressEvents(finalProgressEvents);
@@ -1467,6 +1480,7 @@ function App() {
       if (data.analysis.requirements) setTripContext(data.analysis);
       setShortTermMemory(data.short_term_memory);
     } catch (requestError) {
+      if (requestController.signal.aborted || !isCurrentRequest()) return;
       setMessages((current) => current.map((message) => (
         message.id === pendingMessageId ? { ...message, delivery: "failed" } : message
       )));
@@ -1474,7 +1488,11 @@ function App() {
     } finally {
       isPolling = false;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      setIsSending(false);
+      const wasCurrentRequest = isCurrentRequest();
+      if (wasCurrentRequest) {
+        activeRequestControllerRef.current = null;
+      }
+      if (wasCurrentRequest) setIsSending(false);
     }
   }
 
@@ -1519,6 +1537,9 @@ function App() {
   }
 
   function handleNewSession() {
+    sessionVersionRef.current += 1;
+    activeRequestControllerRef.current?.abort();
+    activeRequestControllerRef.current = null;
     setMessages([]);
     setDraft("");
     setError("");
@@ -1530,6 +1551,7 @@ function App() {
     setConversationId(null);
     setQuickForm(createEmptyQuickForm());
     setIsQuickFormOpen(true);
+    setIsSending(false);
   }
 
   function updateMessagePlan(messageId: number, plan: TripPlanSnapshot) {
@@ -1610,7 +1632,7 @@ function App() {
           <span>
             版权归属{" "}
             <a href="https://github.com/GuLu37/TripWeave" target="_blank" rel="noreferrer">
-              GuLu37/TripWeave
+              GuLu37
             </a>
           </span>
         </footer>

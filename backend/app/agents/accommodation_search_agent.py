@@ -13,7 +13,7 @@ async def search_accommodation(
 ) -> dict[str, object]:
     """把完整住宿需求交给本地酒店估算工具。"""
 
-    check_out = _get_check_out_date(requirements)
+    check_in, check_out = _get_reference_stay_dates(requirements)
     async with track_progress(
         "住宿查询 Agent",
         "生成酒店价格、房型和库存参考",
@@ -21,23 +21,44 @@ async def search_accommodation(
     ):
         return await search_hotels(
             city=requirements.destination or "",
-            check_in=requirements.departure_date or "",
-            check_out=check_out or "",
+            check_in=check_in,
+            check_out=check_out,
             travelers=requirements.traveler_count or 1,
             style=_get_hotel_style(requirements),
         )
 
 
-def _get_check_out_date(requirements: TripRequirements) -> str | None:
+def _get_reference_stay_dates(requirements: TripRequirements) -> tuple[str, str]:
+    """为酒店参考查询补出稳定的入住和退房日期。"""
+
+    today = date.today()
+    check_in = today
+    if requirements.departure_date:
+        try:
+            check_in = date.fromisoformat(requirements.departure_date)
+        except ValueError:
+            check_in = today
+    check_out = _get_check_out_date(requirements, check_in)
+    if check_out is None:
+        check_out = (check_in + timedelta(days=1)).isoformat()
+    return check_in.isoformat(), check_out
+
+
+def _get_check_out_date(
+    requirements: TripRequirements,
+    departure: date,
+) -> str | None:
     """优先使用返程日期，否则按旅行时长计算退房日期。"""
 
     if requirements.return_date:
-        return requirements.return_date
-    if not requirements.departure_date or requirements.trip_duration is None:
+        try:
+            return_date = date.fromisoformat(requirements.return_date)
+        except ValueError:
+            return None
+        if return_date > departure:
+            return return_date.isoformat()
         return None
-    try:
-        departure = date.fromisoformat(requirements.departure_date)
-    except ValueError:
+    if requirements.trip_duration is None:
         return None
     duration = requirements.trip_duration
     stay_days = duration_to_days(duration)

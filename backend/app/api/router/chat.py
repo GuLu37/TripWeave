@@ -1,9 +1,10 @@
 """聊天接口路由。"""
 
+import asyncio
 import logging
 from uuid import uuid4
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
 
 from app.memory.short_term_memory import (
     append_short_term_message,
@@ -35,7 +36,10 @@ async def get_chat_progress(client_request_id: str) -> ChatProgressResponse:
 
 
 @router.post("/messages", response_model=ChatResponse)
-async def create_chat_message(request: ChatRequest) -> ChatResponse:
+async def create_chat_message(
+    http_request: Request,
+    request: ChatRequest,
+) -> ChatResponse:
     """根据提交的对话历史生成回复与统一入口分析结果。"""
 
     # 第一步：首轮创建会话 ID，后续请求复用它以定位服务端 LangGraph 检查点。
@@ -57,12 +61,36 @@ async def create_chat_message(request: ChatRequest) -> ChatResponse:
     # 第三步：由 LangGraph 按 conversation_id 恢复状态并编排入口、规划和审核节点。
     try:
         with bind_progress(client_request_id):
-            analysis = await run_trip_conversation(
-                short_term_memory.recent_messages,
-                conversation_id=str(conversation_id),
-                known_requirements=request.known_requirements,
-                pending_plan=request.pending_plan,
+            workflow_task = asyncio.create_task(
+                run_trip_conversation(
+                    short_term_memory.recent_messages,
+                    conversation_id=str(conversation_id),
+                    known_requirements=request.known_requirements,
+                    pending_plan=request.pending_plan,
+                )
             )
+            disconnect_task = asyncio.create_task(
+                _wait_for_client_disconnect(http_request)
+            )
+            done, pending = await asyncio.wait(
+                {workflow_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if disconnect_task in done and not workflow_task.done():
+                logger.info(
+                    "聊天会话取消：conversation_id=%s client_request_id=%s reason=client_disconnected",
+                    conversation_id,
+                    client_request_id,
+                )
+                workflow_task.cancel()
+                try:
+                    await workflow_task
+                except asyncio.CancelledError:
+                    pass
+                raise HTTPException(status_code=499, detail="请求已取消。")
+            analysis = await workflow_task
     finally:
         finish_progress(client_request_id)
     progress_snapshot = get_progress(client_request_id)
@@ -78,3 +106,10 @@ async def create_chat_message(request: ChatRequest) -> ChatResponse:
         short_term_memory=short_term_memory,
         progress_events=progress_snapshot["events"],
     )
+
+
+async def _wait_for_client_disconnect(request: Request) -> None:
+    """等待浏览器取消或断开当前请求。"""
+
+    while not await request.is_disconnected():
+        await asyncio.sleep(0.25)

@@ -5,7 +5,7 @@ from math import ceil
 
 from app.schemas import TripDuration, TripRequirements
 
-MIN_RECOMMENDED_POI_COUNT = 2
+MIN_RECOMMENDED_POI_COUNT = 3
 MAX_RECOMMENDED_POI_COUNT = 12
 
 

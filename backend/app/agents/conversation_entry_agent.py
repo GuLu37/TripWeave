@@ -111,6 +111,7 @@ async def analyze_intent(
 
     # 第一步：意图节点读取近期消息和窗口外的少量历史，结构化快照继续作为稳定记忆。
     context_messages = _build_agent_context(messages)
+    latest_user_text = _get_latest_user_text(messages)
     try:
         response_text = await chat_with_llm(
             context_messages,
@@ -126,6 +127,13 @@ async def analyze_intent(
             caller_name="conversation_intent_agent",
         )
         model_decision = _parse_intent_payload(response_text)
+        forced_intent = _coerce_direct_query_intent(latest_user_text)
+        if forced_intent is not None and forced_intent != model_decision.intent:
+            return IntentDecision(
+                intent=forced_intent,
+                plan_action=None,
+                reply=model_decision.reply,
+            )
         return model_decision
     except AppException as error:
         record_error(
@@ -591,6 +599,17 @@ def _scan_intent_tags(text: str) -> set[str]:
         for tag, pattern in _INTENT_RULE_PATTERNS.items()
         if pattern.search(text)
     }
+
+
+def _coerce_direct_query_intent(text: str) -> str | None:
+    """把明显的酒店或城际交通直查句子收敛到专用查询分支。"""
+
+    tags = _scan_intent_tags(text)
+    if "accommodation_query" in tags and "transport_query" not in tags:
+        return "accommodation_search"
+    if "transport_query" in tags and "accommodation_query" not in tags:
+        return "intercity_transport_search"
+    return None
 
 
 def _extract_name_from_text(text: str) -> str | None:

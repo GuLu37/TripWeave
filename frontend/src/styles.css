@@ -1629,17 +1629,16 @@ h1 {
 
 .route-planner {
   display: grid;
-  gap: 10px;
-  margin-bottom: 14px;
+  gap: 14px;
+  margin-bottom: 16px;
 }
 
 .route-card-strip {
   display: grid;
-  grid-auto-columns: minmax(150px, 180px);
-  grid-auto-flow: column;
-  gap: 8px;
-  overflow-x: auto;
-  padding: 1px 0 7px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  overflow: visible;
+  padding: 2px 0 4px;
 }
 
 .route-card {
@@ -1687,7 +1686,8 @@ h1 {
   position: relative;
   display: grid;
   place-items: center;
-  aspect-ratio: 4 / 3;
+  aspect-ratio: 16 / 10;
+  min-height: 108px;
   overflow: hidden;
   background: #102337;
 }
@@ -1715,8 +1715,8 @@ h1 {
 
 .route-card__body {
   display: grid;
-  gap: 3px;
-  padding: 8px;
+  gap: 5px;
+  padding: 10px;
 }
 
 .route-card__body span {
@@ -1725,27 +1725,31 @@ h1 {
 }
 
 .route-card__body strong {
+  display: -webkit-box;
   overflow: hidden;
   color: #c9dce7;
   font-size: 12px;
   font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.45;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
 }
 
 .route-card__body small {
+  display: -webkit-box;
   overflow: hidden;
   color: #71899e;
   font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.45;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
 }
 
 .live-map-panel {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 170px;
-  gap: 10px;
-  padding: 10px;
+  grid-template-columns: minmax(0, 1fr) 190px;
+  gap: 12px;
+  padding: 12px;
   border: 1px solid #273f56;
   border-radius: 5px;
   background: #0a1726;
@@ -1779,7 +1783,7 @@ h1 {
 .map-point-list {
   display: grid;
   align-content: start;
-  gap: 7px;
+  gap: 8px;
 }
 
 .map-point {
@@ -1787,7 +1791,7 @@ h1 {
   grid-template-columns: 22px minmax(0, 1fr);
   gap: 2px 7px;
   min-width: 0;
-  padding: 7px;
+  padding: 8px;
   border: 1px solid #244052;
   border-radius: 4px;
   background: #102337;
@@ -3018,11 +3022,27 @@ h1,
   .right-rail {
     border-color: #dce4ea;
   }
+
+  .route-card-strip {
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  }
+
+  .live-map-panel {
+    grid-template-columns: minmax(0, 1fr) 170px;
+  }
 }
 
 @media (max-width: 680px) {
   .sidebar {
     border-color: #dce4ea;
+  }
+
+  .route-card-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .live-map-panel {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

@@ -534,8 +534,7 @@ def _route_after_search_requirement_analysis(
     analysis = state["analysis"]
     return (
         "direct_search"
-        if analysis.is_complete
-        and analysis.intent in {"accommodation_search", "intercity_transport_search"}
+        if analysis.intent in {"accommodation_search", "intercity_transport_search"}
         else "end"
     )
 
@@ -556,13 +555,13 @@ def _get_effective_requirements(
 
 
 def _get_pending_plan(state: object) -> TripPlanSnapshot | None:
-    """读取顶层待确认快照，并兼容旧检查点中的嵌套快照。"""
+    """读取本轮显式待确认快照，并兼容旧检查点中的嵌套快照。"""
 
     if not isinstance(state, dict):
         return None
-    pending_plan = state.get("pending_plan")
-    if isinstance(pending_plan, TripPlanSnapshot):
-        return pending_plan
+    if "pending_plan" in state:
+        pending_plan = state.get("pending_plan")
+        return pending_plan if isinstance(pending_plan, TripPlanSnapshot) else None
     analysis = state.get("analysis")
     if isinstance(analysis, ConversationAnalysis):
         return analysis.pending_plan
@@ -1099,13 +1098,13 @@ def _validate_destination_candidate_match(
     destination: str,
     trip_evidence: object,
 ) -> ValidationIssue | None:
-    """检查住宿是否就近、景点餐饮是否保持在目的地所在市级辖区。"""
+    """检查候选是否仍处于现实旅程可接受的周边范围。"""
 
     if not isinstance(trip_evidence, dict):
         return None
     destination_location = _parse_lng_lat(trip_evidence.get("destination_location"))
-    destination_city = _normalized_city_name(
-        trip_evidence.get("destination_city")
+    destination_province = _normalized_region_name(
+        trip_evidence.get("destination_province")
     )
     groups = [
         ("住宿", trip_evidence.get("accommodation_candidates")),
@@ -1119,7 +1118,7 @@ def _validate_destination_candidate_match(
             continue
         valid_distances: list[float] = []
         names: list[str] = []
-        cities: list[str] = []
+        provinces: list[str] = []
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
@@ -1131,19 +1130,14 @@ def _validate_destination_candidate_match(
             name = candidate.get("name")
             if isinstance(name, str) and name.strip():
                 names.append(name.strip())
-            city = _normalized_city_name(candidate.get("city"))
-            if city is not None:
-                cities.append(city)
-        if (
-            label != "住宿"
-            and destination_city is not None
-            and (
-                not cities
-                or any(city != destination_city for city in cities)
-            )
+            province = _normalized_region_name(candidate.get("province"))
+            if province is not None:
+                provinces.append(province)
+        if destination_province is not None and any(
+            province != destination_province for province in provinces
         ):
             far_groups.append(label)
-        elif label == "住宿" and valid_distances and min(valid_distances) > 60:
+        elif valid_distances and min(valid_distances) > 150:
             far_groups.append(label)
         else:
             continue
@@ -1153,9 +1147,9 @@ def _validate_destination_candidate_match(
         return None
     reason = (
         f"当前草案与已确认目的地“{destination}”严重不匹配："
-        f"{'、'.join(far_groups)}候选不在目的地所在市级辖区"
+        f"{'、'.join(far_groups)}候选跨省或距离目的地过远"
         f"{'（例如' + '；'.join(sample_names[:3]) + '）' if sample_names else ''}。"
-        "请重新检索目的地附近住宿及同市景点、餐饮后再生成方案。"
+        "请重新检索目的地周边合理范围内的住宿、景点和餐饮后再生成方案。"
     )
     return ValidationIssue(
         code="TRIP_DESTINATION_CANDIDATES_MISMATCH",
@@ -1170,6 +1164,16 @@ def _normalized_city_name(value: object) -> str | None:
         return None
     return re.sub(
         r"(?:自治州|地区|盟|市)$",
+        "",
+        re.sub(r"\s+", "", value),
+    )
+
+
+def _normalized_region_name(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return re.sub(
+        r"(?:省|市|自治区|特别行政区|地区|盟|自治州)$",
         "",
         re.sub(r"\s+", "", value),
     )
