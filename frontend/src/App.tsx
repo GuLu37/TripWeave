@@ -1609,8 +1609,8 @@ function App() {
           <strong>TripWeave 旅程智能助手 v1.0.0</strong>
           <span>
             版权归属{" "}
-            <a href="https://github.com/GuLu37" target="_blank" rel="noreferrer">
-              GuLu37
+            <a href="https://github.com/GuLu37/TripWeave" target="_blank" rel="noreferrer">
+              GuLu37/TripWeave
             </a>
           </span>
         </footer>
